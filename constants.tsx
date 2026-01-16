@@ -7,16 +7,11 @@ export const VOICE_OPTIONS: VoiceOption[] = [
   { id: 'v4', name: 'Sia (Narrative)', gender: VoiceGender.FEMALE, geminiVoice: 'Zephyr' },
 ];
 
-// Characters per TTS request to ensure stability
-export const MAX_TEXT_CHUNK_SIZE = 2500;
+export const MAX_TEXT_CHUNK_SIZE = 2500; // Characters per TTS request to ensure stability
 
-// Gemini TTS model
-export const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
-
-// Gemini TTS returns PCM @ 24kHz (commonly used in examples)
-export const TTS_SAMPLE_RATE = 24000;
-
-// Preview sample text for narrator voice preview
+// Short text used when previewing voices
 export const VOICE_PREVIEW_TEXT =
-  "Hello! This is a voice preview for your audiobook narration. " +
-  "I will read clearly with a natural Indian accent and a comfortable pace.";
+  "Hello! This is a quick preview of the narrator's voice for your audiobook. Let's begin.";
+
+// If no clear chapter headings are found, we split the PDF into approximate sections
+export const FALLBACK_SECTION_PAGES = 5;
