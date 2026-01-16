@@ -1,6 +1,6 @@
 export enum VoiceGender {
   MALE = 'MALE',
-  FEMALE = 'FEMALE'
+  FEMALE = 'FEMALE',
 }
 
 export interface VoiceOption {
@@ -12,8 +12,8 @@ export interface VoiceOption {
 
 export interface AudiobookConfig {
   voiceId: string;
-  speed: number; // "requested" reading speed (instruction-based)
-  quality: 'standard' | 'high'; // affects MP3 bitrate
+  speed: number; // 0.7–1.2 (instruction-based)
+  quality: 'standard' | 'high'; // mp3 bitrate
 }
 
 export interface ExtractionStatus {
@@ -23,10 +23,32 @@ export interface ExtractionStatus {
   status: 'idle' | 'processing' | 'completed' | 'error';
 }
 
+export type ChapterStatus =
+  | 'pending'
+  | 'queued'
+  | 'converting'
+  | 'completed'
+  | 'cancelled'
+  | 'skipped'
+  | 'error';
+
+export interface Chapter {
+  id: string;
+  title: string;
+  startPage: number; // 1-indexed
+  endPage: number; // 1-indexed
+  text: string;
+  selected: boolean;
+  status: ChapterStatus;
+  progress: number; // 0-100
+  audioUrl?: string; // MP3 URL
+  error?: string;
+}
+
 export interface AudioGenerationStatus {
-  progress: number;
+  progress: number; // overall 0-100
   status: 'idle' | 'generating' | 'completed' | 'cancelled' | 'error';
-  audioUrl?: string;
+  currentChapterId?: string;
   error?: string;
 }
 
@@ -35,4 +57,11 @@ export type SegmentType = 'narration' | 'meta';
 export interface TextSegment {
   type: SegmentType;
   text: string;
+}
+
+export interface VoicePreviewStatus {
+  status: 'idle' | 'loading' | 'ready' | 'error';
+  voiceId?: string;
+  audioUrl?: string; // MP3 preview URL
+  error?: string;
 }
