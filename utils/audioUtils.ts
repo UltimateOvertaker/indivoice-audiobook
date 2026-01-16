@@ -10,22 +10,14 @@ export function decodeBase64(base64: string): Uint8Array {
   return bytes;
 }
 
-/**
- * Creates silence PCM (16-bit mono) for a given duration in seconds
- */
+/** Create silence PCM (16-bit mono) for X seconds */
 export function createSilencePCM(seconds: number, sampleRate: number): Int16Array {
   const totalSamples = Math.max(0, Math.floor(seconds * sampleRate));
-  return new Int16Array(totalSamples); // zeros = silence
+  return new Int16Array(totalSamples); // zeros
 }
 
-/**
- * Create MP3 blob from PCM 16-bit mono data
- * @param pcmData Int16Array PCM samples
- * @param sampleRate e.g. 24000
- * @param kbps bitrate: 96 or 128 recommended
- */
+/** Create MP3 blob from PCM 16-bit mono data */
 export function createMp3Blob(pcmData: Int16Array, sampleRate: number, kbps = 96): Blob {
-  // lamejs expects 1152-sample frames
   const mp3Encoder = new (lamejs as any).Mp3Encoder(1, sampleRate, kbps);
   const mp3Chunks: Uint8Array[] = [];
 
