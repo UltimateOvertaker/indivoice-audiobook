@@ -1,3 +1,4 @@
+import lamejs from 'lamejs';
 
 export function decodeBase64(base64: string): Uint8Array {
   const binaryString = atob(base64);
@@ -9,80 +10,34 @@ export function decodeBase64(base64: string): Uint8Array {
   return bytes;
 }
 
-export function encodeBase64(bytes: Uint8Array): string {
-  let binary = '';
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
+/**
+ * Creates silence PCM (16-bit mono) for a given duration in seconds
+ */
+export function createSilencePCM(seconds: number, sampleRate: number): Int16Array {
+  const totalSamples = Math.max(0, Math.floor(seconds * sampleRate));
+  return new Int16Array(totalSamples); // zeros = silence
 }
 
 /**
- * Creates a WAV file blob from raw PCM 16-bit mono data
- * @param pcmData Raw PCM data (Int16Array)
- * @param sampleRate Sample rate (e.g., 24000)
+ * Create MP3 blob from PCM 16-bit mono data
+ * @param pcmData Int16Array PCM samples
+ * @param sampleRate e.g. 24000
+ * @param kbps bitrate: 96 or 128 recommended
  */
-export function createWavBlob(pcmData: Int16Array, sampleRate: number): Blob {
-  const buffer = new ArrayBuffer(44 + pcmData.length * 2);
-  const view = new DataView(buffer);
+export function createMp3Blob(pcmData: Int16Array, sampleRate: number, kbps = 96): Blob {
+  // lamejs expects 1152-sample frames
+  const mp3Encoder = new (lamejs as any).Mp3Encoder(1, sampleRate, kbps);
+  const mp3Chunks: Uint8Array[] = [];
 
-  // RIFF identifier
-  writeString(view, 0, 'RIFF');
-  // File length
-  view.setUint32(4, 36 + pcmData.length * 2, true);
-  // RIFF type
-  writeString(view, 8, 'WAVE');
-  // format chunk identifier
-  writeString(view, 12, 'fmt ');
-  // format chunk length
-  view.setUint32(16, 16, true);
-  // sample format (1 is PCM)
-  view.setUint16(20, 1, true);
-  // channel count
-  view.setUint16(22, 1, true);
-  // sample rate
-  view.setUint32(24, sampleRate, true);
-  // byte rate (sampleRate * blockAlign)
-  view.setUint32(28, sampleRate * 2, true);
-  // block align (channel count * bytes per sample)
-  view.setUint16(32, 2, true);
-  // bits per sample
-  view.setUint16(34, 16, true);
-  // data chunk identifier
-  writeString(view, 36, 'data');
-  // data chunk length
-  view.setUint32(40, pcmData.length * 2, true);
-
-  // Write the PCM samples
-  for (let i = 0; i < pcmData.length; i++) {
-    view.setInt16(44 + i * 2, pcmData[i], true);
+  const chunkSize = 1152;
+  for (let i = 0; i < pcmData.length; i += chunkSize) {
+    const chunk = pcmData.subarray(i, i + chunkSize);
+    const mp3buf = mp3Encoder.encodeBuffer(chunk);
+    if (mp3buf.length > 0) mp3Chunks.push(new Uint8Array(mp3buf));
   }
 
-  return new Blob([buffer], { type: 'audio/wav' });
-}
+  const end = mp3Encoder.flush();
+  if (end.length > 0) mp3Chunks.push(new Uint8Array(end));
 
-function writeString(view: DataView, offset: number, string: string) {
-  for (let i = 0; i < string.length; i++) {
-    view.setUint8(offset + i, string.charCodeAt(i));
-  }
-}
-
-export async function decodeAudioBuffer(
-  data: Uint8Array,
-  ctx: AudioContext,
-  sampleRate: number,
-  numChannels: number
-): Promise<AudioBuffer> {
-  const dataInt16 = new Int16Array(data.buffer);
-  const frameCount = dataInt16.length / numChannels;
-  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
-
-  for (let channel = 0; channel < numChannels; channel++) {
-    const channelData = buffer.getChannelData(channel);
-    for (let i = 0; i < frameCount; i++) {
-      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
-    }
-  }
-  return buffer;
+  return new Blob(mp3Chunks, { type: 'audio/mpeg' });
 }
