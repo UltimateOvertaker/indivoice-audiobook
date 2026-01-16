@@ -1,312 +1,208 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { GoogleGenAI, Modality } from '@google/genai';
-import { MAX_TEXT_CHUNK_SIZE, TTS_MODEL, TTS_SAMPLE_RATE, VOICE_OPTIONS, VOICE_PREVIEW_TEXT } from './constants';
+import { FALLBACK_SECTION_PAGES, MAX_TEXT_CHUNK_SIZE, VOICE_OPTIONS, VOICE_PREVIEW_TEXT } from './constants';
 import {
   AudiobookConfig,
   AudioGenerationStatus,
-  BookMeta,
+  Chapter,
+  ChapterStatus,
   ExtractionStatus,
-  PdfChapter,
   VoiceGender,
-  HistoryBook,
+  VoicePreviewStatus,
 } from './types';
-
-import { decodeBase64, createWavBlob } from './utils/audioUtils';
+import { createWavBlob, decodeBase64 } from './utils/audioUtils';
 
 // Global reference for PDF.js provided by the script tag in index.html
 declare const pdfjsLib: any;
 
-/**
- * =========================
- * IndexedDB History (no backend)
- * Stores metadata + per-chapter WAV blobs so users can download later
- * =========================
- */
-const DB_NAME = 'indivoice_history_db';
-const DB_VERSION = 1;
-const STORE_NAME = 'books';
+const SAMPLE_RATE = 24000;
 
-type StoredBook = {
-  meta: BookMeta;
-  // Each chapter stores audio blob optionally (structured clone supports Blob)
-  chapters: Array<{
-    id: string;
-    title: string;
-    startPage: number;
-    endPage: number;
-    audioBlob?: Blob;
-    createdAt: number;
-  }>;
-};
-
-function openDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        db.createObjectStore(STORE_NAME, { keyPath: 'meta.id' });
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function idbPutBook(book: StoredBook): Promise<void> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    const store = tx.objectStore(STORE_NAME);
-    store.put(book);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-async function idbGetAllBooks(): Promise<StoredBook[]> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readonly');
-    const store = tx.objectStore(STORE_NAME);
-    const req = store.getAll();
-    req.onsuccess = () => resolve(req.result || []);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function idbDeleteBook(bookId: string): Promise<void> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    const store = tx.objectStore(STORE_NAME);
-
-    // keyPath is meta.id, so we delete by full key by scanning
-    const getReq = store.getAll();
-    getReq.onsuccess = () => {
-      const all = getReq.result || [];
-      const match = all.find((b: StoredBook) => b.meta.id === bookId);
-      if (!match) {
-        resolve();
-        return;
-      }
-
-      // Delete requires key — since keyPath is meta.id, this works:
-      const delReq = store.delete(bookId as any);
-      delReq.onsuccess = () => resolve();
-      delReq.onerror = () => reject(delReq.error);
-    };
-    getReq.onerror = () => reject(getReq.error);
-  });
-}
-
-function safeFileName(input: string) {
+function sanitizeFilenamePart(input: string): string {
   return input
-    .replace(/\.pdf$/i, '')
-    .replace(/[\/\\?%*:|"<>]/g, '-')
-    .replace(/\s+/g, ' ')
+    .replace(/[^a-z0-9\- _]/gi, '')
+    .replace(/\s+/g, '_')
+    .slice(0, 60)
     .trim();
 }
 
-function nowId() {
-  return `${Date.now()}_${Math.floor(Math.random() * 1e9)}`;
-}
+function splitTextIntoChunks(text: string, maxChunkSize: number): string[] {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (!clean) return [];
 
-function clamp(n: number, a: number, b: number) {
-  return Math.max(a, Math.min(b, n));
-}
+  const chunks: string[] = [];
+  let idx = 0;
 
-/**
- * =========================
- * Chapter Detection
- * 1) Use PDF outline if available
- * 2) Fallback to heuristics scanning first text on each page
- * =========================
- */
+  while (idx < clean.length) {
+    let chunk = clean.slice(idx, idx + maxChunkSize);
 
-type OutlineItem = {
-  title: string;
-  dest?: any;
-  items?: OutlineItem[];
-};
-
-async function outlineToChapters(pdf: any, totalPages: number): Promise<Array<{ title: string; startPage: number }>> {
-  try {
-    const outline: OutlineItem[] | null = await pdf.getOutline();
-    if (!outline || outline.length === 0) return [];
-
-    const flat: Array<{ title: string; startPage: number }> = [];
-
-    async function resolveDestToPage(dest: any): Promise<number | null> {
-      try {
-        let destination = dest;
-        if (typeof dest === 'string') {
-          destination = await pdf.getDestination(dest);
-        }
-        if (!destination || !Array.isArray(destination)) return null;
-
-        const ref = destination[0];
-        const pageIndex = await pdf.getPageIndex(ref);
-        return pageIndex + 1; // convert to 1-based
-      } catch {
-        return null;
+    // Try to end on a sentence boundary for smoother narration.
+    if (idx + maxChunkSize < clean.length) {
+      const lastStop = Math.max(chunk.lastIndexOf('.'), chunk.lastIndexOf('!'), chunk.lastIndexOf('?'));
+      if (lastStop > maxChunkSize * 0.65) {
+        chunk = chunk.slice(0, lastStop + 1);
       }
     }
 
-    async function walk(items: OutlineItem[]) {
-      for (const it of items) {
-        const title = (it.title || '').trim();
-        if (it.dest) {
-          const p = await resolveDestToPage(it.dest);
-          if (p && p >= 1 && p <= totalPages && title) {
-            flat.push({ title, startPage: p });
-          }
-        }
-        if (it.items && it.items.length) {
-          await walk(it.items);
-        }
-      }
-    }
-
-    await walk(outline);
-
-    // Clean + sort + unique by startPage
-    const sorted = flat
-      .filter(x => x.title && x.startPage)
-      .sort((a, b) => a.startPage - b.startPage);
-
-    const unique: Array<{ title: string; startPage: number }> = [];
-    const seenPages = new Set<number>();
-    for (const item of sorted) {
-      if (!seenPages.has(item.startPage)) {
-        unique.push(item);
-        seenPages.add(item.startPage);
-      }
-    }
-
-    // If outline has only 1 item, it might be useless (whole doc)
-    if (unique.length < 2) return [];
-
-    return unique;
-  } catch {
-    return [];
+    chunks.push(chunk);
+    idx += chunk.length;
   }
+
+  return chunks;
 }
 
-function heuristicChaptersFromPages(pageTexts: string[], totalPages: number) {
-  const candidates: Array<{ title: string; startPage: number }> = [];
+function getHeadingFromPage(pageText: string): string | null {
+  const head = pageText.slice(0, 1800);
+  const lines = head
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .slice(0, 30);
 
-  const patterns = [
-    /\bchapter\s+\d+\b/i,
-    /\bchapter\s+[ivxlcdm]+\b/i,
-    /\bsection\s+\d+(\.\d+)?\b/i,
-    /^\s*\d+\.\s+[A-Z]/m,
-    /^\s*[IVXLCDM]+\.\s+[A-Z]/m,
+  // Common book headings
+  const patterns: RegExp[] = [
+    /^(chapter|chap\.?|ch\.?|section|part)\s+([0-9ivxlcdm]+)\b\s*[:.\-–—]?\s*(.{0,80})$/i,
+    /^(preface|foreword|introduction|prologue|epilogue|afterword|acknowledgements|acknowledgments)\b.*$/i,
+    /^(\d{1,3})\s*[\.-]\s*(.{3,80})$/,
   ];
 
-  for (let p = 1; p <= totalPages; p++) {
-    const t = (pageTexts[p - 1] || '').trim();
-    if (!t) continue;
-
-    const head = t.slice(0, 800);
-
-    let matchedTitle: string | null = null;
-
-    // Prefer explicit CHAPTER/SECTION hits
-    for (const pat of patterns) {
-      const m = head.match(pat);
-      if (m) {
-        // Title guess: take first ~80 chars around match
-        const idx = head.toLowerCase().indexOf(m[0].toLowerCase());
-        const start = Math.max(0, idx - 10);
-        const end = Math.min(head.length, idx + 80);
-        matchedTitle = head.slice(start, end).replace(/\s+/g, ' ').trim();
-        break;
-      }
-    }
-
-    // Additional: if the first line is short & capital-ish, treat as heading
-    if (!matchedTitle) {
-      const firstLine = head.split('\n')[0]?.trim() || '';
-      if (firstLine.length >= 6 && firstLine.length <= 60) {
-        const capsRatio = firstLine.replace(/[^A-Z]/g, '').length / Math.max(1, firstLine.replace(/[^A-Za-z]/g, '').length);
-        if (capsRatio > 0.6) matchedTitle = firstLine;
-      }
-    }
-
-    if (matchedTitle) {
-      candidates.push({ title: matchedTitle, startPage: p });
+  for (const line of lines) {
+    // Ignore pure numbers (page numbers)
+    if (/^\d{1,4}$/.test(line)) continue;
+    if (line.length < 4) continue;
+    for (const re of patterns) {
+      if (re.test(line)) return line;
     }
   }
-
-  // Deduplicate + sort
-  const sorted = candidates.sort((a, b) => a.startPage - b.startPage);
-  const filtered: Array<{ title: string; startPage: number }> = [];
-  let lastPage = -999;
-
-  for (const c of sorted) {
-    // avoid too-close chapters (noise). keep at least 2 pages gap.
-    if (c.startPage - lastPage >= 2) {
-      filtered.push(c);
-      lastPage = c.startPage;
-    }
-  }
-
-  // If too many, cap
-  return filtered.slice(0, 50);
+  return null;
 }
 
-function buildChaptersWithRanges(
-  starts: Array<{ title: string; startPage: number }>,
-  totalPages: number
-): Array<{ title: string; startPage: number; endPage: number }> {
-  const sorted = [...starts].sort((a, b) => a.startPage - b.startPage);
+function detectChaptersFromPages(pagesText: string[]): Chapter[] {
+  const totalPages = pagesText.length;
+  const markers: Array<{ page: number; title: string }> = [];
 
-  // Ensure startPage is within bounds
-  const valid = sorted.filter(s => s.startPage >= 1 && s.startPage <= totalPages);
-
-  // If no chapters found -> single
-  if (valid.length === 0) {
-    return [{ title: 'Full Document', startPage: 1, endPage: totalPages }];
+  for (let i = 0; i < totalPages; i++) {
+    const heading = getHeadingFromPage(pagesText[i] ?? '');
+    if (heading) {
+      const title = heading.replace(/\s+/g, ' ').trim();
+      markers.push({ page: i + 1, title });
+    }
   }
 
-  // If first chapter doesn't start at 1, add Front Matter
-  if (valid[0].startPage > 1) {
-    valid.unshift({ title: 'Front Matter / Preface', startPage: 1 });
+  // De-dupe consecutive headings (some PDFs repeat the heading on multiple pages)
+  const deduped: Array<{ page: number; title: string }> = [];
+  for (const m of markers) {
+    const prev = deduped[deduped.length - 1];
+    if (!prev || prev.title.toLowerCase() !== m.title.toLowerCase()) {
+      deduped.push(m);
+    }
   }
 
-  const chapters = valid.map((c, idx) => {
-    const next = valid[idx + 1];
-    const endPage = next ? Math.max(c.startPage, next.startPage - 1) : totalPages;
-    return {
-      title: c.title || `Chapter ${idx + 1}`,
-      startPage: c.startPage,
-      endPage,
-    };
+  // If headings are too sparse, fall back to page-based sections.
+  const usableHeadings = deduped.filter((m, idx, arr) => {
+    const prev = arr[idx - 1];
+    if (!prev) return true;
+    return m.page - prev.page >= 2;
   });
 
-  // Remove empty ranges
-  return chapters.filter(ch => ch.endPage >= ch.startPage);
-}
+  const chapters: Chapter[] = [];
 
-function buildChapterText(pageTexts: string[], startPage: number, endPage: number) {
-  const chunks: string[] = [];
-  for (let p = startPage; p <= endPage; p++) {
-    const t = pageTexts[p - 1] || '';
-    chunks.push(t);
+  if (usableHeadings.length >= 2) {
+    for (let i = 0; i < usableHeadings.length; i++) {
+      const startPage = usableHeadings[i].page;
+      const endPage = i < usableHeadings.length - 1 ? usableHeadings[i + 1].page - 1 : totalPages;
+
+      if (endPage < startPage) continue;
+
+      const text = pagesText.slice(startPage - 1, endPage).join('\n\n').trim();
+      if (!text) continue;
+
+      chapters.push({
+        id: `ch_${startPage}_${endPage}`,
+        title: usableHeadings[i].title,
+        startPage,
+        endPage,
+        text,
+        selected: true,
+        status: 'pending',
+        progress: 0,
+      });
+    }
+  } else if (usableHeadings.length === 1) {
+    const start = usableHeadings[0].page;
+
+    // Front matter (optional)
+    if (start > 1) {
+      const fmText = pagesText.slice(0, start - 1).join('\n\n').trim();
+      if (fmText) {
+        chapters.push({
+          id: `ch_1_${start - 1}`,
+          title: 'Front Matter',
+          startPage: 1,
+          endPage: start - 1,
+          text: fmText,
+          selected: true,
+          status: 'pending',
+          progress: 0,
+        });
+      }
+    }
+
+    const mainText = pagesText.slice(start - 1).join('\n\n').trim();
+    if (mainText) {
+      chapters.push({
+        id: `ch_${start}_${totalPages}`,
+        title: usableHeadings[0].title,
+        startPage: start,
+        endPage: totalPages,
+        text: mainText,
+        selected: true,
+        status: 'pending',
+        progress: 0,
+      });
+    }
+  } else {
+    // Fallback: split by fixed page blocks
+    const block = Math.max(1, FALLBACK_SECTION_PAGES);
+    let sectionNo = 1;
+    for (let startPage = 1; startPage <= totalPages; startPage += block) {
+      const endPage = Math.min(totalPages, startPage + block - 1);
+      const text = pagesText.slice(startPage - 1, endPage).join('\n\n').trim();
+      if (!text) continue;
+      chapters.push({
+        id: `sec_${sectionNo}_${startPage}_${endPage}`,
+        title: `Section ${sectionNo}`,
+        startPage,
+        endPage,
+        text,
+        selected: true,
+        status: 'pending',
+        progress: 0,
+      });
+      sectionNo++;
+    }
   }
-  return chunks.join('\n\n');
+
+  // Safety: if everything failed, treat whole document as one chapter
+  if (chapters.length === 0) {
+    const allText = pagesText.join('\n\n').trim();
+    chapters.push({
+      id: 'ch_all',
+      title: 'Full Document',
+      startPage: 1,
+      endPage: totalPages,
+      text: allText,
+      selected: true,
+      status: 'pending',
+      progress: 0,
+    });
+  }
+
+  return chapters;
 }
 
-/**
- * =========================
- * App
- * =========================
- */
 const App: React.FC = () => {
   const [file, setFile] = useState<File | null>(null);
 
-  // PDF extraction state
   const [extraction, setExtraction] = useState<ExtractionStatus>({
     totalPageCount: 0,
     currentPage: 0,
@@ -314,634 +210,687 @@ const App: React.FC = () => {
     status: 'idle',
   });
 
-  const pageTextsRef = useRef<string[]>([]);
-  const [chapters, setChapters] = useState<PdfChapter[]>([]);
+  const [chapters, setChapters] = useState<Chapter[]>([]);
 
-  const [bookMeta, setBookMeta] = useState<BookMeta | null>(null);
-
-  // Voice config
   const [config, setConfig] = useState<AudiobookConfig>({
     voiceId: VOICE_OPTIONS[1].id, // Aditi (Warm)
     speed: 1.0,
     quality: 'high',
   });
 
-  // Overall generation status
   const [generation, setGeneration] = useState<AudioGenerationStatus>({
     progress: 0,
     status: 'idle',
   });
 
-  // Voice preview
-  const [voicePreviewUrl, setVoicePreviewUrl] = useState<string | null>(null);
-  const [voicePreviewLoading, setVoicePreviewLoading] = useState(false);
+  const [voicePreview, setVoicePreview] = useState<VoicePreviewStatus>({ status: 'idle' });
 
-  // History
-  const [history, setHistory] = useState<HistoryBook[]>([]);
-  const [historyLoading, setHistoryLoading] = useState(true);
-
-  // UI refs
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const previewAudioRef = useRef<HTMLAudioElement>(null);
-
-  // Cancel refs
-  const cancelAllRef = useRef(false);
-  const cancelChapterIdsRef = useRef<Set<string>>(new Set());
-
-  // Gemini client
-  const aiRef = useRef<GoogleGenAI | null>(null);
+  const cancelAllRef = useRef<boolean>(false);
+  const cancelledChapterIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
-    // Initialize PDF.js worker using a compatible version URL
     if (typeof pdfjsLib !== 'undefined') {
       pdfjsLib.GlobalWorkerOptions.workerSrc =
         'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
     }
   }, []);
 
-  // Load history on mount
+  // Clean up any object URLs when leaving page
   useEffect(() => {
-    (async () => {
-      try {
-        setHistoryLoading(true);
-        const all = await idbGetAllBooks();
-        const mapped: HistoryBook[] = all
-          .sort((a, b) => b.meta.createdAt - a.meta.createdAt)
-          .map(b => ({
-            meta: b.meta,
-            chapters: b.chapters.map(ch => ({
-              id: ch.id,
-              title: ch.title,
-              startPage: ch.startPage,
-              endPage: ch.endPage,
-              hasAudio: !!ch.audioBlob,
-            })),
-          }));
-        setHistory(mapped);
-      } catch (e) {
-        console.error('Failed to load history:', e);
-      } finally {
-        setHistoryLoading(false);
-      }
-    })();
+    return () => {
+      chapters.forEach((c) => c.audioUrl && URL.revokeObjectURL(c.audioUrl));
+      if (voicePreview.audioUrl) URL.revokeObjectURL(voicePreview.audioUrl);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const selectedVoice = useMemo(() => VOICE_OPTIONS.find(v => v.id === config.voiceId), [config.voiceId]);
+  const selectedVoice = useMemo(() => VOICE_OPTIONS.find((v) => v.id === config.voiceId), [config.voiceId]);
+  const selectedChapters = useMemo(() => chapters.filter((c) => c.selected), [chapters]);
+  const completedSelected = useMemo(
+    () => selectedChapters.filter((c) => c.status === 'completed').length,
+    [selectedChapters]
+  );
 
-  function ensureAiClient() {
-    if (!aiRef.current) {
-      aiRef.current = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const overallLabel = useMemo(() => {
+    if (generation.status === 'generating') {
+      const total = selectedChapters.length || 1;
+      return `Converting ${completedSelected}/${total} chapters…`;
     }
-    return aiRef.current!;
-  }
+    return '';
+  }, [generation.status, completedSelected, selectedChapters.length]);
+
+  const resetAll = () => {
+    cancelAllRef.current = false;
+    cancelledChapterIdsRef.current.clear();
+    setGeneration({ status: 'idle', progress: 0 });
+    setVoicePreview({ status: 'idle' });
+  };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
-    if (selectedFile && selectedFile.type === 'application/pdf') {
-      // Reset
-      cancelAllRef.current = false;
-      cancelChapterIdsRef.current = new Set();
+    if (!selectedFile || selectedFile.type !== 'application/pdf') return;
 
-      setFile(selectedFile);
-      setVoicePreviewUrl(null);
+    // Cleanup old urls
+    chapters.forEach((c) => c.audioUrl && URL.revokeObjectURL(c.audioUrl));
+    if (voicePreview.audioUrl) URL.revokeObjectURL(voicePreview.audioUrl);
 
-      setChapters([]);
-      pageTextsRef.current = [];
-
-      setGeneration({ status: 'idle', progress: 0 });
-      setExtraction({ totalPageCount: 0, currentPage: 0, text: '', status: 'idle' });
-
-      await extractPdfAndDetectChapters(selectedFile);
-    }
+    setFile(selectedFile);
+    setChapters([]);
+    resetAll();
+    await extractText(selectedFile);
   };
 
-  async function extractPdfAndDetectChapters(pdfFile: File) {
+  const extractText = async (pdfFile: File) => {
     if (typeof pdfjsLib === 'undefined') {
-      setExtraction(prev => ({ ...prev, status: 'error' }));
+      setExtraction((prev) => ({ ...prev, status: 'error' }));
       console.error('PDF.js not loaded yet.');
       return;
     }
 
     setExtraction({ totalPageCount: 0, currentPage: 0, text: '', status: 'processing' });
-
     try {
       const arrayBuffer = await pdfFile.arrayBuffer();
       const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
       const pdf = await loadingTask.promise;
 
-      // Metadata
-      let titleGuess = safeFileName(pdfFile.name);
-      let authorGuess = '';
+      const perPageText: string[] = [];
+      setExtraction((prev) => ({ ...prev, totalPageCount: pdf.numPages }));
 
-      try {
-        const meta = await pdf.getMetadata();
-        const info = meta?.info || {};
-        const md = meta?.metadata || null;
-
-        const t1 = (info.Title || '').toString().trim();
-        const a1 = (info.Author || '').toString().trim();
-        const t2 = md?.get?.('dc:title') || '';
-        const a2 = md?.get?.('dc:creator') || '';
-
-        titleGuess = (t1 || t2 || titleGuess).toString().trim();
-        authorGuess = (a1 || a2 || '').toString().trim();
-      } catch {
-        // ignore metadata errors
-      }
-
-      setExtraction(prev => ({ ...prev, totalPageCount: pdf.numPages }));
-
-      const perPageTexts: string[] = [];
       let fullText = '';
-
       for (let i = 1; i <= pdf.numPages; i++) {
         const page = await pdf.getPage(i);
         const content = await page.getTextContent();
 
-        // Join items into one page text
-        const pageText = (content.items || [])
-          .map((item: any) => item.str)
-          .join(' ')
-          .replace(/\s+/g, ' ')
+        const pageText = content.items
+          .map((item: any) => {
+            const str = item?.str ?? '';
+            const eol = item?.hasEOL ? '\n' : ' ';
+            return str + eol;
+          })
+          .join('')
+          .replace(/\n{3,}/g, '\n\n')
           .trim();
 
-        perPageTexts.push(pageText);
+        perPageText.push(pageText);
         fullText += pageText + '\n\n';
 
-        setExtraction(prev => ({
-          ...prev,
-          currentPage: i,
-          text: fullText,
-          status: 'processing',
-        }));
+        setExtraction((prev) => ({ ...prev, currentPage: i, text: fullText }));
       }
 
-      pageTextsRef.current = perPageTexts;
+      setExtraction((prev) => ({ ...prev, status: 'completed' }));
 
-      // Detect chapters
-      const outlineStarts = await outlineToChapters(pdf, pdf.numPages);
-      const starts = outlineStarts.length ? outlineStarts : heuristicChaptersFromPages(perPageTexts, pdf.numPages);
-
-      const ranged = buildChaptersWithRanges(starts, pdf.numPages);
-
-      const initialChapters: PdfChapter[] = ranged.map((c, idx) => ({
-        id: `ch_${idx + 1}_${c.startPage}_${c.endPage}`,
-        title: c.title || `Chapter ${idx + 1}`,
-        startPage: c.startPage,
-        endPage: c.endPage,
-        selected: true,
-        status: 'pending',
-        progress: 0,
-      }));
-
-      setChapters(initialChapters);
-
-      const meta: BookMeta = {
-        id: nowId(),
-        fileName: pdfFile.name,
-        title: titleGuess || safeFileName(pdfFile.name),
-        author: authorGuess || '',
-        totalPages: pdf.numPages,
-        createdAt: Date.now(),
-      };
-      setBookMeta(meta);
-
-      // Save base book to history (no audio yet)
-      const baseStored: StoredBook = {
-        meta,
-        chapters: initialChapters.map(ch => ({
-          id: ch.id,
-          title: ch.title,
-          startPage: ch.startPage,
-          endPage: ch.endPage,
-          createdAt: Date.now(),
-        })),
-      };
-      await idbPutBook(baseStored);
-
-      // Refresh history list
-      const all = await idbGetAllBooks();
-      const mapped: HistoryBook[] = all
-        .sort((a, b) => b.meta.createdAt - a.meta.createdAt)
-        .map(b => ({
-          meta: b.meta,
-          chapters: b.chapters.map(ch => ({
-            id: ch.id,
-            title: ch.title,
-            startPage: ch.startPage,
-            endPage: ch.endPage,
-            hasAudio: !!ch.audioBlob,
-          })),
-        }));
-      setHistory(mapped);
-
-      setExtraction(prev => ({
-        ...prev,
-        status: 'completed',
-      }));
-    } catch (error) {
-      console.error('PDF Extraction Error:', error);
-      setExtraction(prev => ({ ...prev, status: 'error' }));
+      // Detect chapters immediately
+      const detected = detectChaptersFromPages(perPageText);
+      setChapters(detected);
+    } catch (err) {
+      console.error('PDF Extraction Error:', err);
+      setExtraction((prev) => ({ ...prev, status: 'error' }));
     }
-  }
+  };
 
-  function toggleSelectAll(selectAll: boolean) {
-    setChapters(prev =>
-      prev.map(ch => ({
-        ...ch,
-        selected: selectAll,
-      }))
-    );
-  }
+  const toggleChapterSelected = (id: string) => {
+    if (generation.status === 'generating') return;
+    setChapters((prev) => prev.map((c) => (c.id === id ? { ...c, selected: !c.selected } : c)));
+  };
 
-  function toggleChapterSelected(chapterId: string) {
-    setChapters(prev =>
-      prev.map(ch => (ch.id === chapterId ? { ...ch, selected: !ch.selected } : ch))
-    );
-  }
+  const selectAllChapters = () => {
+    if (generation.status === 'generating') return;
+    setChapters((prev) => prev.map((c) => ({ ...c, selected: true })));
+  };
 
-  function skipChapter(chapterId: string) {
-    // "Cancel/Skip" chapter even before it runs
-    cancelChapterIdsRef.current.add(chapterId);
-    setChapters(prev =>
-      prev.map(ch =>
-        ch.id === chapterId
-          ? { ...ch, selected: false, status: 'skipped', progress: 0 }
-          : ch
-      )
-    );
-  }
+  const deselectAllChapters = () => {
+    if (generation.status === 'generating') return;
+    setChapters((prev) => prev.map((c) => ({ ...c, selected: false })));
+  };
 
-  function cancelAll() {
-    cancelAllRef.current = true;
-
-    // Mark all selected chapters as cancelled (or keep completed)
-    setChapters(prev =>
-      prev.map(ch => {
-        if (ch.status === 'completed') return ch;
-        return ch.selected ? { ...ch, status: 'cancelled', progress: 0 } : ch;
+  const cancelChapter = (id: string) => {
+    cancelledChapterIdsRef.current.add(id);
+    setChapters((prev) =>
+      prev.map((c) => {
+        if (c.id !== id) return c;
+        if (c.status === 'completed') return c;
+        return { ...c, status: 'cancelled', progress: 0 };
       })
     );
+  };
 
-    setGeneration(prev => ({
-      ...prev,
-      status: 'cancelled',
-      error: 'Cancelled by user',
-    }));
-  }
+  const cancelAll = () => {
+    cancelAllRef.current = true;
+    setGeneration((prev) => ({ ...prev, status: 'cancelled' }));
 
-  async function previewSelectedVoice() {
-    if (!selectedVoice) return;
-    if (!process.env.API_KEY) {
-      alert('API_KEY is missing. Please add it in Vercel Environment Variables.');
-      return;
+    setChapters((prev) =>
+      prev.map((c) => {
+        if (!c.selected) return c;
+        if (c.status === 'completed') return c;
+        if (c.status === 'cancelled') return c;
+        return { ...c, status: 'cancelled', progress: 0 };
+      })
+    );
+  };
+
+  const downloadFromUrl = (audioUrl: string, filename: string) => {
+    const link = document.createElement('a');
+    link.href = audioUrl;
+    link.download = filename;
+    link.click();
+  };
+
+  const downloadChapter = (chapter: Chapter) => {
+    if (!chapter.audioUrl) return;
+    const base = file?.name.replace(/\.pdf$/i, '') || 'audiobook';
+    const title = sanitizeFilenamePart(chapter.title || `Chapter_${chapter.startPage}`);
+    downloadFromUrl(chapter.audioUrl, `IndiVoice_${base}_${title}.wav`);
+  };
+
+  const downloadAllCompleted = () => {
+    const completed = chapters.filter((c) => c.selected && c.status === 'completed' && c.audioUrl);
+    if (completed.length === 0) return;
+
+    completed.forEach((c, idx) => {
+      setTimeout(() => downloadChapter(c), idx * 300);
+    });
+  };
+
+  const convertTextToWavUrl = async (
+    text: string,
+    voiceName: string,
+    speed: number,
+    shouldCancel: () => boolean,
+    onProgress: (pct: number) => void
+  ): Promise<{ audioUrl?: string; status: ChapterStatus; error?: string }> => {
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+    const chunks = splitTextIntoChunks(text, MAX_TEXT_CHUNK_SIZE);
+    if (chunks.length === 0) {
+      return { status: 'error', error: 'No readable text found in this section.' };
     }
 
-    setVoicePreviewLoading(true);
-    try {
-      const ai = ensureAiClient();
+    const pcmChunks: Int16Array[] = [];
+
+    for (let i = 0; i < chunks.length; i++) {
+      if (shouldCancel()) {
+        return { status: 'cancelled' };
+      }
+
+      const chunk = chunks[i].trim();
+      if (!chunk) continue;
+
+      const prompt = `Read this text clearly as an Indian audiobook narrator.\nSpeed factor: ${speed}.\nText: ${chunk}`;
 
       const response = await ai.models.generateContent({
-        model: TTS_MODEL,
-        contents: [{ parts: [{ text: VOICE_PREVIEW_TEXT }] }],
+        model: 'gemini-2.5-flash-preview-tts',
+        contents: [{ parts: [{ text: prompt }] }],
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
             voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName: selectedVoice.geminiVoice,
-              },
+              prebuiltVoiceConfig: { voiceName },
             },
           },
         },
       });
 
-      const part = response.candidates?.[0]?.content?.parts?.[0];
-      const base64Audio = (part as any)?.inlineData?.data;
+      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (base64Audio) {
+        const bytes = decodeBase64(base64Audio);
+        const pcm = new Int16Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+        pcmChunks.push(pcm);
+      }
 
-      if (!base64Audio) throw new Error('No preview audio returned.');
-
-      const audioBytes = decodeBase64(base64Audio);
-      const pcmData = new Int16Array(audioBytes.buffer);
-
-      const wavBlob = createWavBlob(pcmData, TTS_SAMPLE_RATE);
-      const url = URL.createObjectURL(wavBlob);
-
-      setVoicePreviewUrl(url);
-
-      setTimeout(() => {
-        if (previewAudioRef.current) {
-          previewAudioRef.current.playbackRate = clamp(config.speed, 0.7, 1.3);
-          previewAudioRef.current.play().catch(() => {});
-        }
-      }, 50);
-    } catch (e: any) {
-      console.error('Voice preview failed:', e);
-      alert(e?.message || 'Voice preview failed');
-    } finally {
-      setVoicePreviewLoading(false);
-    }
-  }
-
-  async function generateAudiobookChapters() {
-    if (!bookMeta) return;
-    if (!process.env.API_KEY) {
-      alert('API_KEY is missing. Please add it in Vercel Environment Variables.');
-      return;
+      const pct = Math.round(((i + 1) / chunks.length) * 100);
+      onProgress(pct);
     }
 
-    const selected = chapters.filter(ch => ch.selected);
-
-    if (selected.length === 0) {
-      alert('Please select at least one chapter.');
-      return;
+    if (shouldCancel()) {
+      return { status: 'cancelled' };
     }
+
+    if (pcmChunks.length === 0) {
+      return { status: 'error', error: 'The TTS model returned no audio for this section.' };
+    }
+
+    const totalLength = pcmChunks.reduce((acc, c) => acc + c.length, 0);
+    const combinedPcm = new Int16Array(totalLength);
+    let offset = 0;
+    for (const c of pcmChunks) {
+      combinedPcm.set(c, offset);
+      offset += c.length;
+    }
+
+    const wavBlob = createWavBlob(combinedPcm, SAMPLE_RATE);
+    const audioUrl = URL.createObjectURL(wavBlob);
+
+    return { status: 'completed', audioUrl };
+  };
+
+  const generateSelectedChapters = async () => {
+    if (!selectedVoice) return;
+    if (selectedChapters.length === 0) return;
 
     cancelAllRef.current = false;
-    cancelChapterIdsRef.current = new Set();
+    cancelledChapterIdsRef.current.clear();
 
-    // Reset statuses for selected chapters that aren't completed
-    setChapters(prev =>
-      prev.map(ch => {
-        if (!ch.selected) return ch;
-        if (ch.status === 'completed') return ch;
-        return { ...ch, status: 'pending', progress: 0, error: undefined, audioUrl: undefined };
+    setChapters((prev) =>
+      prev.map((c) => {
+        if (!c.selected) return c;
+        if (c.status === 'completed') return c;
+        return { ...c, status: 'queued', progress: 0, error: undefined };
       })
     );
 
-    setGeneration({
-      status: 'generating',
-      progress: 0,
-      currentChapterTitle: selected[0]?.title,
-    });
+    setGeneration({ status: 'generating', progress: 0 });
 
     try {
-      const ai = ensureAiClient();
-      const voice = VOICE_OPTIONS.find(v => v.id === config.voiceId);
-      if (!voice) throw new Error('Selected voice not found');
+      const toConvert = chapters.filter((c) => c.selected);
+      const total = toConvert.length;
+      let done = 0;
 
-      // Load stored book so we can update chapter blobs progressively
-      const allBooks = await idbGetAllBooks();
-      const storedBook = allBooks.find(b => b.meta.id === bookMeta.id);
-      if (!storedBook) throw new Error('History store not initialized for this book.');
-
-      const totalToProcess = selected.length;
-      let doneCount = 0;
-
-      for (const ch of selected) {
+      for (const ch of toConvert) {
         if (cancelAllRef.current) break;
-        if (cancelChapterIdsRef.current.has(ch.id)) {
-          // already skipped
-          doneCount++;
+        if (cancelledChapterIdsRef.current.has(ch.id)) {
+          done++;
           continue;
         }
 
-        setGeneration(prev => ({ ...prev, currentChapterTitle: ch.title }));
-
-        // Mark chapter generating
-        setChapters(prev =>
-          prev.map(c => (c.id === ch.id ? { ...c, status: 'generating', progress: 0 } : c))
+        setGeneration((prev) => ({ ...prev, currentChapterId: ch.id }));
+        setChapters((prev) =>
+          prev.map((c) => (c.id === ch.id ? { ...c, status: 'converting', progress: 0 } : c))
         );
 
-        const chapterText = buildChapterText(pageTextsRef.current, ch.startPage, ch.endPage).trim();
-        if (!chapterText) {
-          setChapters(prev =>
-            prev.map(c => (c.id === ch.id ? { ...c, status: 'error', error: 'Chapter text empty' } : c))
+        const shouldCancel = () => cancelAllRef.current || cancelledChapterIdsRef.current.has(ch.id);
+
+        const result = await convertTextToWavUrl(ch.text, selectedVoice.geminiVoice, config.speed, shouldCancel, (pct) => {
+          setChapters((prev) => prev.map((c) => (c.id === ch.id ? { ...c, progress: pct } : c)));
+        });
+
+        if (result.status === 'completed' && result.audioUrl) {
+          setChapters((prev) =>
+            prev.map((c) => (c.id === ch.id ? { ...c, status: 'completed', progress: 100, audioUrl: result.audioUrl } : c))
           );
-          doneCount++;
-          continue;
-        }
-
-        try {
-          // Split into chunks to avoid request size limits
-          const textChunks: string[] = [];
-          for (let i = 0; i < chapterText.length; i += MAX_TEXT_CHUNK_SIZE) {
-            textChunks.push(chapterText.slice(i, i + MAX_TEXT_CHUNK_SIZE));
-          }
-
-          const audioChunks: Uint8Array[] = [];
-
-          for (let i = 0; i < textChunks.length; i++) {
-            if (cancelAllRef.current) throw new Error('CANCELLED_ALL');
-            if (cancelChapterIdsRef.current.has(ch.id)) throw new Error('CANCELLED_CHAPTER');
-
-            const chunkText = textChunks[i];
-
-            const response = await ai.models.generateContent({
-              model: TTS_MODEL,
-              contents: [{ parts: [{ text: chunkText }] }],
-              config: {
-                responseModalities: [Modality.AUDIO],
-                speechConfig: {
-                  voiceConfig: {
-                    prebuiltVoiceConfig: {
-                      voiceName: voice.geminiVoice,
-                    },
-                  },
-                },
-              },
-            });
-
-            const part = response.candidates?.[0]?.content?.parts?.[0];
-            const base64Audio = (part as any)?.inlineData?.data;
-
-            if (!base64Audio) throw new Error('No audio returned from Gemini');
-
-            const audioBytes = decodeBase64(base64Audio);
-            audioChunks.push(audioBytes);
-
-            const chapterProgress = Math.round(((i + 1) / textChunks.length) * 100);
-
-            setChapters(prev =>
-              prev.map(c => (c.id === ch.id ? { ...c, progress: chapterProgress } : c))
-            );
-          }
-
-          // Combine audio chunks
-          const totalBytes = audioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-          const combined = new Uint8Array(totalBytes);
-          let offset = 0;
-          for (const chunk of audioChunks) {
-            combined.set(chunk, offset);
-            offset += chunk.length;
-          }
-
-          // Ensure even length for Int16Array
-          const evenCombined = combined.byteLength % 2 === 0 ? combined : combined.slice(0, combined.byteLength - 1);
-
-          const pcmData = new Int16Array(evenCombined.buffer);
-          const wavBlob = createWavBlob(pcmData, TTS_SAMPLE_RATE);
-
-          const audioUrl = URL.createObjectURL(wavBlob);
-
-          // Mark chapter complete in UI
-          setChapters(prev =>
-            prev.map(c =>
-              c.id === ch.id ? { ...c, status: 'completed', progress: 100, audioUrl } : c
-            )
-          );
-
-          // Save chapter blob to history (so it appears in History even after refresh)
-          const storedChapter = storedBook.chapters.find(sc => sc.id === ch.id);
-          if (storedChapter) {
-            storedChapter.audioBlob = wavBlob;
-          }
-
-          await idbPutBook(storedBook);
-
-          // Refresh history UI
-          const all = await idbGetAllBooks();
-          const mapped: HistoryBook[] = all
-            .sort((a, b) => b.meta.createdAt - a.meta.createdAt)
-            .map(b => ({
-              meta: b.meta,
-              chapters: b.chapters.map(cc => ({
-                id: cc.id,
-                title: cc.title,
-                startPage: cc.startPage,
-                endPage: cc.endPage,
-                hasAudio: !!cc.audioBlob,
-              })),
-            }));
-          setHistory(mapped);
-
-          doneCount++;
-          const overall = Math.round((doneCount / totalToProcess) * 100);
-
-          setGeneration(prev => ({
-            ...prev,
-            progress: overall,
-          }));
-        } catch (err: any) {
-          if (err?.message === 'CANCELLED_ALL') {
-            setChapters(prev =>
-              prev.map(c => (c.id === ch.id ? { ...c, status: 'cancelled', progress: 0 } : c))
-            );
-            break;
-          }
-
-          if (err?.message === 'CANCELLED_CHAPTER') {
-            setChapters(prev =>
-              prev.map(c => (c.id === ch.id ? { ...c, status: 'cancelled', progress: 0 } : c))
-            );
-            doneCount++;
-            continue;
-          }
-
-          console.error('Chapter generation failed:', err);
-
-          setChapters(prev =>
-            prev.map(c =>
+        } else if (result.status === 'cancelled') {
+          setChapters((prev) => prev.map((c) => (c.id === ch.id ? { ...c, status: 'cancelled', progress: 0 } : c)));
+        } else {
+          setChapters((prev) =>
+            prev.map((c) =>
               c.id === ch.id
-                ? { ...c, status: 'error', error: err?.message || 'Failed', progress: 0 }
+                ? { ...c, status: 'error', progress: 0, error: result.error || 'Failed to convert this chapter.' }
                 : c
             )
           );
-
-          doneCount++;
-          const overall = Math.round((doneCount / totalToProcess) * 100);
-          setGeneration(prev => ({ ...prev, progress: overall }));
         }
+
+        done++;
+        setGeneration((prev) => ({ ...prev, progress: Math.round((done / total) * 100) }));
       }
 
       if (cancelAllRef.current) {
-        setGeneration(prev => ({
-          ...prev,
-          status: 'cancelled',
-          error: 'Cancelled by user',
-        }));
+        setGeneration((prev) => ({ ...prev, status: 'cancelled' }));
         return;
       }
 
-      setGeneration(prev => ({
-        ...prev,
-        status: 'completed',
-        progress: 100,
-      }));
-    } catch (e: any) {
-      console.error('Audiobook generation failed:', e);
-      setGeneration({
-        status: 'error',
-        progress: 0,
-        error: e?.message || 'Something went wrong',
+      setGeneration((prev) => ({ ...prev, status: 'completed', progress: 100 }));
+    } catch (err: any) {
+      console.error('Generation error:', err);
+      setGeneration({ status: 'error', progress: 0, error: err?.message || 'Failed to generate audiobook.' });
+    }
+  };
+
+  const previewVoice = async (voiceId: string) => {
+    const voice = VOICE_OPTIONS.find((v) => v.id === voiceId);
+    if (!voice) return;
+
+    if (voicePreview.audioUrl) URL.revokeObjectURL(voicePreview.audioUrl);
+
+    setVoicePreview({ status: 'loading', voiceId });
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash-preview-tts',
+        contents: [
+          {
+            parts: [
+              {
+                text: `Read this in a natural Indian audiobook tone. Speed factor: ${config.speed}. Text: ${VOICE_PREVIEW_TEXT}`,
+              },
+            ],
+          },
+        ],
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: voice.geminiVoice },
+            },
+          },
+        },
       });
+
+      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (!base64Audio) throw new Error('No audio returned for preview.');
+
+      const bytes = decodeBase64(base64Audio);
+      const pcm = new Int16Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+      const wav = createWavBlob(pcm, SAMPLE_RATE);
+      const url = URL.createObjectURL(wav);
+
+      setVoicePreview({ status: 'ready', voiceId, audioUrl: url });
+    } catch (err: any) {
+      console.error('Voice preview error:', err);
+      setVoicePreview({ status: 'error', voiceId, error: err?.message || 'Preview failed.' });
     }
-  }
+  };
 
-  function downloadChapter(ch: PdfChapter) {
-    if (!ch.audioUrl) return;
-    const bookName = bookMeta?.title || safeFileName(file?.name || 'audiobook');
-    const fileName = `${safeFileName(bookName)} - ${safeFileName(ch.title)}.wav`;
-
-    const link = document.createElement('a');
-    link.href = ch.audioUrl;
-    link.download = fileName;
-    link.click();
-  }
-
-  function downloadAllCompletedChapters() {
-    const completed = chapters.filter(c => c.status === 'completed' && c.audioUrl);
-    if (completed.length === 0) {
-      alert('No completed chapters to download yet.');
-      return;
-    }
-
-    // Trigger sequential downloads (browser may ask for permission)
-    for (const ch of completed) {
-      downloadChapter(ch);
-    }
-  }
-
-  async function downloadHistoryChapter(bookId: string, chapterId: string) {
-    try {
-      const all = await idbGetAllBooks();
-      const book = all.find(b => b.meta.id === bookId);
-      if (!book) return;
-
-      const ch = book.chapters.find(c => c.id === chapterId);
-      if (!ch || !ch.audioBlob) return;
-
-      const url = URL.createObjectURL(ch.audioBlob);
-
-      const bookName = book.meta.title || safeFileName(book.meta.fileName);
-      const fileName = `${safeFileName(bookName)} - ${safeFileName(ch.title)}.wav`;
-
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = fileName;
-      link.click();
-    } catch (e) {
-      console.error('History download failed:', e);
-      alert('Failed to download from history.');
-    }
-  }
-
-  async function deleteHistoryBook(bookId: string) {
-    if (!confirm('Delete this book from history? This cannot be undone.')) return;
-    try {
-      await idbDeleteBook(bookId);
-      const all = await idbGetAllBooks();
-      const mapped: HistoryBook[] = all
-        .sort((a, b) => b.meta.createdAt - a.meta.createdAt)
-        .map(b => ({
-          meta: b.meta,
-          chapters: b.chapters.map(cc => ({
-            id: cc.id,
-            title: cc.title,
-            startPage: cc.startPage,
-            endPage: cc.endPage,
-            hasAudio: !!cc.audioBlob,
-          })),
-        }));
-      setHistory(mapped);
-    } catch (e) {
-      console.error('Delete history failed:', e);
-      alert('Failed to delete.');
-    }
-  }
-
-  const selectedCount = useMemo(() => chapters.filter(c => c.selected).length, [chapters]);
-  const completedCount = useMemo(() => chapters.filter(c => c.status === 'completed').length, [chapters]);
+  const canStart = extraction.status === 'completed' && selectedChapters.length > 0 && generation.status !== 'generating';
 
   return (
-    <div className="min-h-screen flex
+    <div className="max-w-6xl mx-auto px-4 py-8 md:py-16">
+      <header className="text-center mb-10">
+        <div className="inline-block bg-indigo-100 text-indigo-700 px-4 py-1 rounded-full text-xs font-bold tracking-widest uppercase mb-4">
+          PDF to Audiobook
+        </div>
+        <h1 className="text-4xl md:text-5xl font-black text-indigo-950 mb-3">
+          IndiVoice <span className="text-indigo-500">🎧</span>
+        </h1>
+        <p className="text-slate-500 text-lg max-w-2xl mx-auto">
+          Auto-detect chapters, convert one-by-one, and download each chapter as soon as it is ready.
+        </p>
+      </header>
+
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+        {/* LEFT */}
+        <div className="lg:col-span-4 space-y-6">
+          {/* 1. Document */}
+          <section className="bg-white rounded-3xl p-6 shadow-sm border border-slate-100">
+            <h2 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4">1. Document</h2>
+            <div
+              onClick={() => fileInputRef.current?.click()}
+              className={`border-2 border-dashed rounded-2xl p-6 text-center cursor-pointer transition-all ${
+                file ? 'border-indigo-200 bg-indigo-50/30' : 'border-slate-200 hover:border-indigo-300'
+              }`}
+            >
+              <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" accept=".pdf" />
+              <div className="text-3xl mb-2">{file ? '📄' : '📤'}</div>
+              <p className="text-sm font-semibold text-slate-700 truncate">{file ? file.name : 'Choose PDF'}</p>
+
+              {extraction.status === 'processing' && (
+                <p className="text-[10px] font-bold text-indigo-600 mt-2">
+                  Reading: {extraction.currentPage}/{extraction.totalPageCount}
+                </p>
+              )}
+
+              {extraction.status === 'error' && (
+                <p className="text-[10px] font-bold text-red-600 mt-2">Could not read this PDF. Try another file.</p>
+              )}
+            </div>
+          </section>
+
+          {/* 2. Chapters */}
+          <section className="bg-white rounded-3xl p-6 shadow-sm border border-slate-100">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xs font-bold text-slate-400 uppercase tracking-widest">2. Chapters</h2>
+              {chapters.length > 0 && generation.status !== 'generating' && (
+                <div className="flex gap-2">
+                  <button
+                    onClick={selectAllChapters}
+                    className="text-[10px] font-bold px-2 py-1 rounded-lg bg-slate-50 border border-slate-100 text-slate-600 hover:bg-slate-100"
+                  >
+                    All
+                  </button>
+                  <button
+                    onClick={deselectAllChapters}
+                    className="text-[10px] font-bold px-2 py-1 rounded-lg bg-slate-50 border border-slate-100 text-slate-600 hover:bg-slate-100"
+                  >
+                    None
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {extraction.status !== 'completed' && (
+              <div className="text-sm text-slate-400">Upload a PDF to detect chapters automatically.</div>
+            )}
+
+            {extraction.status === 'completed' && chapters.length > 0 && (
+              <div className="space-y-2 max-h-64 overflow-y-auto custom-scrollbar">
+                {chapters.map((ch) => (
+                  <div
+                    key={ch.id}
+                    className={`rounded-2xl border p-3 flex items-start gap-3 ${
+                      ch.selected ? 'border-indigo-200 bg-indigo-50/30' : 'border-slate-100 bg-white'
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={ch.selected}
+                      disabled={generation.status === 'generating'}
+                      onChange={() => toggleChapterSelected(ch.id)}
+                      className="mt-1 accent-indigo-600"
+                    />
+
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="text-xs font-bold text-slate-700 truncate">{ch.title}</div>
+                        <div className="text-[10px] font-bold text-slate-400 shrink-0">
+                          p.{ch.startPage}–{ch.endPage}
+                        </div>
+                      </div>
+
+                      <div className="mt-2 flex items-center gap-2">
+                        <span
+                          className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                            ch.status === 'completed'
+                              ? 'bg-emerald-100 text-emerald-700'
+                              : ch.status === 'converting'
+                              ? 'bg-indigo-100 text-indigo-700'
+                              : ch.status === 'cancelled'
+                              ? 'bg-amber-100 text-amber-700'
+                              : ch.status === 'error'
+                              ? 'bg-red-100 text-red-700'
+                              : 'bg-slate-100 text-slate-600'
+                          }`}
+                        >
+                          {ch.status}
+                        </span>
+
+                        {ch.status === 'converting' && (
+                          <span className="text-[10px] font-bold text-indigo-600">{ch.progress}%</span>
+                        )}
+                      </div>
+
+                      {ch.status === 'converting' && (
+                        <div className="mt-2 w-full bg-indigo-100 h-1.5 rounded-full overflow-hidden">
+                          <div className="h-full bg-indigo-500" style={{ width: `${ch.progress}%` }} />
+                        </div>
+                      )}
+
+                      {ch.status === 'error' && ch.error && <div className="mt-2 text-[10px] text-red-600">{ch.error}</div>}
+
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {ch.status === 'completed' && ch.audioUrl && (
+                          <>
+                            <button
+                              onClick={() => downloadChapter(ch)}
+                              className="text-[10px] font-bold px-3 py-1 rounded-xl bg-indigo-600 text-white hover:bg-indigo-700"
+                            >
+                              Download
+                            </button>
+                            <audio controls src={ch.audioUrl} className="h-8 w-full" />
+                          </>
+                        )}
+
+                        {(ch.status === 'queued' || ch.status === 'converting' || ch.status === 'pending') &&
+                          generation.status === 'generating' && (
+                            <button
+                              onClick={() => cancelChapter(ch.id)}
+                              className="text-[10px] font-bold px-3 py-1 rounded-xl bg-amber-100 text-amber-800 hover:bg-amber-200"
+                            >
+                              Cancel Chapter
+                            </button>
+                          )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+
+          {/* 3. Voice */}
+          <section className="bg-white rounded-3xl p-6 shadow-sm border border-slate-100">
+            <h2 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4">3. Voice Settings</h2>
+
+            <div className="grid grid-cols-2 gap-2 mb-4">
+              {VOICE_OPTIONS.map((v) => (
+                <button
+                  key={v.id}
+                  onClick={() => setConfig((prev) => ({ ...prev, voiceId: v.id }))}
+                  className={`p-2 rounded-xl border text-[10px] font-bold transition-all ${
+                    config.voiceId === v.id
+                      ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
+                      : 'border-slate-100 bg-slate-50 text-slate-500'
+                  }`}
+                >
+                  {v.name.split(' ')[0]} ({v.gender === VoiceGender.MALE ? 'M' : 'F'})
+                </button>
+              ))}
+            </div>
+
+            <div className="flex items-center justify-between mb-2">
+              <label className="text-[10px] font-bold text-slate-400 uppercase">Speed: {config.speed}x</label>
+              {selectedVoice && (
+                <button
+                  onClick={() => previewVoice(config.voiceId)}
+                  className="text-[10px] font-bold px-2 py-1 rounded-lg bg-slate-50 border border-slate-100 text-slate-600 hover:bg-slate-100"
+                >
+                  Preview
+                </button>
+              )}
+            </div>
+
+            <input
+              type="range"
+              min="0.5"
+              max="1.5"
+              step="0.1"
+              className="w-full h-1 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+              value={config.speed}
+              onChange={(e) => setConfig((prev) => ({ ...prev, speed: parseFloat(e.target.value) }))}
+            />
+
+            {voicePreview.status === 'loading' && (
+              <div className="mt-3 text-[10px] font-bold text-slate-400">Generating voice preview…</div>
+            )}
+
+            {voicePreview.status === 'ready' && voicePreview.audioUrl && (
+              <div className="mt-3">
+                <audio controls src={voicePreview.audioUrl} className="w-full h-8" />
+              </div>
+            )}
+
+            {voicePreview.status === 'error' && (
+              <div className="mt-3 text-[10px] font-bold text-red-600">{voicePreview.error}</div>
+            )}
+          </section>
+
+          {/* Convert buttons */}
+          <div className="space-y-3">
+            <button
+              disabled={!canStart}
+              onClick={generateSelectedChapters}
+              className="w-full bg-indigo-600 text-white font-bold py-4 rounded-2xl shadow-lg hover:bg-indigo-700 disabled:bg-slate-300 transition-all"
+            >
+              {generation.status === 'generating' ? `Narrating… ${generation.progress}%` : 'Convert Selected Chapters'}
+            </button>
+
+            {generation.status === 'generating' && (
+              <button
+                onClick={cancelAll}
+                className="w-full bg-amber-100 text-amber-900 font-bold py-3 rounded-2xl border border-amber-200 hover:bg-amber-200 transition-all"
+              >
+                Cancel Whole Book
+              </button>
+            )}
+
+            {generation.status === 'completed' && (
+              <button
+                onClick={downloadAllCompleted}
+                className="w-full bg-slate-900 text-white font-bold py-3 rounded-2xl hover:bg-slate-800 transition-all"
+              >
+                Download All Completed Chapters
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* RIGHT */}
+        <div className="lg:col-span-8 space-y-6">
+          <div className="bg-white rounded-3xl shadow-sm border border-slate-100 overflow-hidden">
+            <div className="px-6 py-4 border-b border-slate-50 flex justify-between items-center bg-slate-50/30">
+              <h3 className="text-xs font-bold text-slate-500 uppercase">Conversion Status</h3>
+              <div className="text-[10px] font-bold text-slate-400">
+                {selectedChapters.length > 0 ? `${selectedChapters.length} selected` : 'No chapters selected'}
+              </div>
+            </div>
+
+            <div className="p-6">
+              {generation.status === 'idle' && <div className="text-sm text-slate-400">Ready when you are.</div>}
+
+              {generation.status === 'generating' && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="text-sm font-semibold text-slate-700">{overallLabel}</div>
+                    <div className="text-xs font-bold text-indigo-600">{generation.progress}%</div>
+                  </div>
+                  <div className="w-full bg-indigo-100 h-2 rounded-full overflow-hidden">
+                    <div className="h-full bg-indigo-500" style={{ width: `${generation.progress}%` }} />
+                  </div>
+                  <div className="text-[10px] text-slate-500">
+                    You can download completed chapters immediately from the chapter list.
+                  </div>
+                </div>
+              )}
+
+              {generation.status === 'completed' && (
+                <div className="space-y-2">
+                  <div className="text-sm font-semibold text-emerald-700">✅ Done! Your chapters are ready.</div>
+                  <div className="text-[10px] text-slate-500">
+                    Use “Download All Completed Chapters” (left panel) or download individual chapters.
+                  </div>
+                </div>
+              )}
+
+              {generation.status === 'cancelled' && (
+                <div className="space-y-2">
+                  <div className="text-sm font-semibold text-amber-700">⚠️ Conversion cancelled.</div>
+                  <div className="text-[10px] text-slate-500">Already completed chapters remain available for download.</div>
+                </div>
+              )}
+
+              {generation.status === 'error' && (
+                <div className="text-sm text-red-600">❌ {generation.error || 'Something went wrong.'}</div>
+              )}
+            </div>
+          </div>
+
+          <div className="bg-white rounded-3xl shadow-sm border border-slate-100 overflow-hidden flex flex-col min-h-[420px]">
+            <div className="px-6 py-4 border-b border-slate-50 flex justify-between items-center bg-slate-50/30">
+              <h3 className="text-xs font-bold text-slate-500 uppercase">Text Preview</h3>
+              {extraction.text && (
+                <span className="text-[10px] font-bold text-slate-400">{extraction.text.length} characters</span>
+              )}
+            </div>
+            <div className="flex-1 p-6 overflow-y-auto max-h-[420px] custom-scrollbar text-slate-600 leading-relaxed text-sm font-serif italic whitespace-pre-wrap">
+              {extraction.text || (
+                <div className="h-full flex items-center justify-center text-slate-300 italic">No document loaded</div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default App;
