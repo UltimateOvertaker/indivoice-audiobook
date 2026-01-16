@@ -7,11 +7,9 @@ export const VOICE_OPTIONS: VoiceOption[] = [
   { id: 'v4', name: 'Sia (Narrative)', gender: VoiceGender.FEMALE, geminiVoice: 'Zephyr' },
 ];
 
-export const MAX_TEXT_CHUNK_SIZE = 2500; // Characters per TTS request to ensure stability
+// Keep this moderate to avoid request-size issues
+export const MAX_TEXT_CHUNK_SIZE = 2400;
 
-// Short text used when previewing voices
+// Used for voice preview + narration tuning
 export const VOICE_PREVIEW_TEXT =
-  "Hello! This is a quick preview of the narrator's voice for your audiobook. Let's begin.";
-
-// If no clear chapter headings are found, we split the PDF into approximate sections
-export const FALLBACK_SECTION_PAGES = 5;
+  "Hello! This is a quick preview of the narrator voice for your audiobook. The pace is natural, with clear pauses and good intonation.";
