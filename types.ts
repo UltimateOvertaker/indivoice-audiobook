@@ -12,7 +12,7 @@ export interface VoiceOption {
 
 export interface AudiobookConfig {
   voiceId: string;
-  speed: number; // UI playback speed (player rate)
+  speed: number;
   quality: 'standard' | 'high';
 }
 
@@ -24,49 +24,37 @@ export interface ExtractionStatus {
 }
 
 export type ChapterStatus =
-  | 'idle'
   | 'pending'
-  | 'generating'
+  | 'queued'
+  | 'converting'
   | 'completed'
-  | 'skipped'
   | 'cancelled'
+  | 'skipped'
   | 'error';
 
-export interface PdfChapter {
+export interface Chapter {
   id: string;
   title: string;
-  startPage: number;
-  endPage: number;
+  startPage: number; // 1-indexed
+  endPage: number; // 1-indexed
+  text: string;
   selected: boolean;
   status: ChapterStatus;
-  progress: number; // 0-100 for that chapter
+  progress: number; // 0-100
   audioUrl?: string;
   error?: string;
 }
 
 export interface AudioGenerationStatus {
-  progress: number; // overall progress 0-100
-  status: 'idle' | 'generating' | 'completed' | 'error' | 'cancelled';
-  currentChapterTitle?: string;
+  progress: number; // overall 0-100
+  status: 'idle' | 'generating' | 'completed' | 'cancelled' | 'error';
+  currentChapterId?: string;
   error?: string;
 }
 
-export interface BookMeta {
-  id: string; // internal id
-  fileName: string; // pdf file name
-  title: string; // metadata title or editable
-  author: string; // metadata author or editable
-  totalPages: number;
-  createdAt: number;
-}
-
-export interface HistoryBook {
-  meta: BookMeta;
-  chapters: Array<{
-    id: string;
-    title: string;
-    startPage: number;
-    endPage: number;
-    hasAudio: boolean;
-  }>;
+export interface VoicePreviewStatus {
+  status: 'idle' | 'loading' | 'ready' | 'error';
+  voiceId?: string;
+  audioUrl?: string;
+  error?: string;
 }
