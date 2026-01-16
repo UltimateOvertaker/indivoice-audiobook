@@ -1,9 +1,8 @@
-
 import React, { useState, useRef, useEffect } from 'react';
 import { GoogleGenAI, Modality } from '@google/genai';
 import { VOICE_OPTIONS, MAX_TEXT_CHUNK_SIZE } from './constants';
 import { VoiceOption, AudiobookConfig, ExtractionStatus, AudioGenerationStatus, VoiceGender } from './types';
-import { decodeBase64, createWavBlob } from './utils/audioUtils';
+import { decodeBase64, createWavBlob } from './audioUtils';
 
 // Global reference for PDF.js provided by the script tag in index.html
 declare const pdfjsLib: any;
@@ -79,197 +78,297 @@ const App: React.FC = () => {
   const generateAudiobook = async () => {
     if (!extraction.text) return;
 
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     setGeneration({ status: 'generating', progress: 0 });
-    
+
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      const selectedVoice = VOICE_OPTIONS.find(v => v.id === config.voiceId)!;
-      
-      const cleanText = extraction.text.replace(/\s+/g, ' ').trim();
-      
-      // Split text into chunks
-      const textChunks: string[] = [];
-      let currentIdx = 0;
-      while (currentIdx < cleanText.length) {
-        let chunk = cleanText.substring(currentIdx, currentIdx + MAX_TEXT_CHUNK_SIZE);
-        if (currentIdx + MAX_TEXT_CHUNK_SIZE < cleanText.length) {
-          const lastPeriod = chunk.lastIndexOf('.');
-          if (lastPeriod > MAX_TEXT_CHUNK_SIZE * 0.7) {
-            chunk = chunk.substring(0, lastPeriod + 1);
-          }
-        }
-        textChunks.push(chunk);
-        currentIdx += chunk.length;
+      // Split text into chunks to avoid request size limits
+      const textChunks = [];
+      for (let i = 0; i < extraction.text.length; i += MAX_TEXT_CHUNK_SIZE) {
+        textChunks.push(extraction.text.slice(i, i + MAX_TEXT_CHUNK_SIZE));
       }
 
-      const pcmChunks: Int16Array[] = [];
-      const totalChunks = textChunks.length;
+      const selectedVoice = VOICE_OPTIONS.find(v => v.id === config.voiceId);
+      if (!selectedVoice) throw new Error("Selected voice not found");
 
-      for (let i = 0; i < totalChunks; i++) {
-        const chunk = textChunks[i].trim();
-        if (!chunk) continue;
+      const audioChunks: Uint8Array[] = [];
 
-        const prompt = `Read this text clearly as an Indian audiobook narrator. 
-        Tone: ${selectedVoice.name}. 
-        Speed factor: ${config.speed}.
-        Text: "${chunk}"`;
+      for (let i = 0; i < textChunks.length; i++) {
+        const chunkText = textChunks[i];
 
         const response = await ai.models.generateContent({
-          model: "gemini-2.5-flash-preview-tts",
-          contents: [{ parts: [{ text: prompt }] }],
+          model: 'gemini-2.5-flash-preview-tts',
+          contents: [{ parts: [{ text: chunkText }] }],
           config: {
             responseModalities: [Modality.AUDIO],
             speechConfig: {
               voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: selectedVoice.geminiVoice },
+                prebuiltVoiceConfig: {
+                  voiceName: selectedVoice.geminiVoice,
+                },
               },
             },
           },
         });
 
-        const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-        if (base64Audio) {
-          const bytes = decodeBase64(base64Audio);
-          pcmChunks.push(new Int16Array(bytes.buffer));
+        const part = response.candidates?.[0]?.content?.parts?.[0];
+        const base64Audio = (part as any)?.inlineData?.data;
+
+        if (!base64Audio) {
+          throw new Error("No audio returned from Gemini");
         }
 
-        setGeneration(prev => ({ 
-          ...prev, 
-          progress: Math.round(((i + 1) / totalChunks) * 100) 
-        }));
+        const audioBytes = decodeBase64(base64Audio);
+        audioChunks.push(audioBytes);
+
+        setGeneration({
+          status: 'generating',
+          progress: Math.round(((i + 1) / textChunks.length) * 100),
+        });
       }
 
-      if (pcmChunks.length === 0) throw new Error("No audio was generated.");
-
-      const totalLength = pcmChunks.reduce((acc, chunk) => acc + chunk.length, 0);
-      const combinedPcm = new Int16Array(totalLength);
+      // Combine audio chunks
+      const combined = new Uint8Array(audioChunks.reduce((sum, chunk) => sum + chunk.length, 0));
       let offset = 0;
-      for (const chunk of pcmChunks) {
-        combinedPcm.set(chunk, offset);
+      for (const chunk of audioChunks) {
+        combined.set(chunk, offset);
         offset += chunk.length;
       }
 
-      const wavBlob = createWavBlob(combinedPcm, 24000);
+      // Convert PCM bytes -> WAV blob for download/playback
+      const pcmData = new Int16Array(combined.buffer);
+      const wavBlob = createWavBlob(pcmData, 24000);
+
       const audioUrl = URL.createObjectURL(wavBlob);
-      
+
       setGeneration({
         status: 'completed',
         progress: 100,
         audioUrl,
       });
 
+      if (audioRef.current) {
+        audioRef.current.src = audioUrl;
+      }
     } catch (error: any) {
-      console.error('Audio Generation Error:', error);
+      console.error("Audiobook generation failed:", error);
       setGeneration({
         status: 'error',
         progress: 0,
-        error: error.message || 'Failed to generate audio.',
+        error: error?.message || "Something went wrong",
       });
     }
   };
 
   const downloadAudio = () => {
-    if (generation.audioUrl) {
-      const link = document.createElement('a');
-      link.href = generation.audioUrl;
-      link.download = `IndiVoice_${file?.name.replace('.pdf', '') || 'Audio'}.wav`;
-      link.click();
-    }
+    if (!generation.audioUrl) return;
+    const link = document.createElement('a');
+    link.href = generation.audioUrl;
+    link.download = `${file?.name.replace('.pdf', '') || 'audiobook'}.wav`;
+    link.click();
   };
 
-  return (
-    <div className="max-w-5xl mx-auto px-4 py-8 md:py-16">
-      <header className="text-center mb-10">
-        <div className="inline-block bg-indigo-100 text-indigo-700 px-4 py-1 rounded-full text-xs font-bold tracking-widest uppercase mb-4">
-          PDF to Audiobook
-        </div>
-        <h1 className="text-4xl md:text-5xl font-black text-indigo-950 mb-3">
-          IndiVoice <span className="text-indigo-500">🎧</span>
-        </h1>
-        <p className="text-slate-500 text-lg max-w-xl mx-auto">
-          Convert PDFs into audiobooks with soulful Indian voices.
-        </p>
-      </header>
+  const selectedVoice = VOICE_OPTIONS.find(v => v.id === config.voiceId);
 
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-        <div className="lg:col-span-4 space-y-6">
-          <section className="bg-white rounded-3xl p-6 shadow-sm border border-slate-100">
-            <h2 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4">1. Document</h2>
-            <div 
-              onClick={() => fileInputRef.current?.click()}
-              className={`border-2 border-dashed rounded-2xl p-6 text-center cursor-pointer transition-all ${
-                file ? 'border-indigo-200 bg-indigo-50/30' : 'border-slate-200 hover:border-indigo-300'
-              }`}
-            >
-              <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" accept=".pdf" />
-              <div className="text-3xl mb-2">{file ? '📄' : '📤'}</div>
-              <p className="text-sm font-semibold text-slate-700 truncate">{file ? file.name : 'Choose PDF'}</p>
+  return (
+    <div className="min-h-screen flex items-center justify-center p-4">
+      <div className="w-full max-w-4xl bg-white/80 backdrop-blur-sm shadow-xl rounded-2xl overflow-hidden">
+        {/* Header */}
+        <div className="p-6 border-b border-slate-200 bg-gradient-to-r from-rose-50 to-sky-50">
+          <h1 className="text-3xl font-bold text-slate-900">IndiVoice PDF Audiobook</h1>
+          <p className="text-slate-600 mt-1">Convert your PDFs into audiobooks with natural Indian voices.</p>
+        </div>
+
+        <div className="p-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* Left Column */}
+          <div className="space-y-6">
+            {/* Upload Section */}
+            <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+              <h2 className="text-lg font-semibold text-slate-900 mb-3">1) Upload PDF</h2>
+
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="application/pdf"
+                className="hidden"
+                onChange={handleFileChange}
+              />
+
+              <button
+                className="w-full py-3 rounded-lg border-2 border-dashed border-slate-300 hover:border-slate-400 text-slate-700 font-medium transition"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                {file ? `✅ ${file.name}` : "Click to Upload PDF"}
+              </button>
+
               {extraction.status === 'processing' && (
-                <p className="text-[10px] font-bold text-indigo-600 mt-2">Reading: {extraction.currentPage}/{extraction.totalPageCount}</p>
+                <div className="mt-3 text-sm text-slate-600">
+                  Extracting text... Page {extraction.currentPage} / {extraction.totalPageCount || '...'}
+                </div>
+              )}
+
+              {extraction.status === 'completed' && (
+                <div className="mt-3 text-sm text-green-700">
+                  ✅ Text extracted successfully!
+                </div>
+              )}
+
+              {extraction.status === 'error' && (
+                <div className="mt-3 text-sm text-red-700">
+                  ❌ Failed to extract text. Try another PDF.
+                </div>
               )}
             </div>
-          </section>
 
-          <section className="bg-white rounded-3xl p-6 shadow-sm border border-slate-100">
-            <h2 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4">2. Voice Settings</h2>
-            <div className="grid grid-cols-2 gap-2 mb-4">
-              {VOICE_OPTIONS.map((v) => (
-                <button
-                  key={v.id}
-                  onClick={() => setConfig({ ...config, voiceId: v.id })}
-                  className={`p-2 rounded-xl border text-[10px] font-bold transition-all ${
-                    config.voiceId === v.id ? 'border-indigo-500 bg-indigo-50 text-indigo-700' : 'border-slate-100 bg-slate-50 text-slate-500'
-                  }`}
-                >
-                  {v.name.split(' ')[0]} ({v.gender === VoiceGender.MALE ? 'M' : 'F'})
-                </button>
-              ))}
+            {/* Voice Settings */}
+            <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+              <h2 className="text-lg font-semibold text-slate-900 mb-4">2) Voice Settings</h2>
+
+              {/* Voice selection */}
+              <label className="block text-sm font-medium text-slate-700 mb-2">
+                Choose voice
+              </label>
+              <select
+                className="w-full p-3 rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-sky-400"
+                value={config.voiceId}
+                onChange={(e) => setConfig(prev => ({ ...prev, voiceId: e.target.value }))}
+              >
+                {VOICE_OPTIONS.map((voice) => (
+                  <option key={voice.id} value={voice.id}>
+                    {voice.name} ({voice.gender === VoiceGender.MALE ? 'Male' : 'Female'})
+                  </option>
+                ))}
+              </select>
+
+              {/* Speed */}
+              <div className="mt-5">
+                <label className="block text-sm font-medium text-slate-700 mb-2">
+                  Reading speed: {config.speed.toFixed(1)}x
+                </label>
+                <input
+                  type="range"
+                  min={0.7}
+                  max={1.3}
+                  step={0.1}
+                  value={config.speed}
+                  onChange={(e) => setConfig(prev => ({ ...prev, speed: parseFloat(e.target.value) }))}
+                  className="w-full"
+                />
+              </div>
+
+              {/* Quality */}
+              <div className="mt-5">
+                <label className="block text-sm font-medium text-slate-700 mb-2">
+                  Audio quality
+                </label>
+                <div className="flex gap-3">
+                  <button
+                    className={`flex-1 py-2 rounded-lg border ${
+                      config.quality === 'standard'
+                        ? 'bg-sky-50 border-sky-400 text-sky-800'
+                        : 'border-slate-300 text-slate-700'
+                    }`}
+                    onClick={() => setConfig(prev => ({ ...prev, quality: 'standard' }))}
+                  >
+                    Standard
+                  </button>
+                  <button
+                    className={`flex-1 py-2 rounded-lg border ${
+                      config.quality === 'high'
+                        ? 'bg-sky-50 border-sky-400 text-sky-800'
+                        : 'border-slate-300 text-slate-700'
+                    }`}
+                    onClick={() => setConfig(prev => ({ ...prev, quality: 'high' }))}
+                  >
+                    High
+                  </button>
+                </div>
+              </div>
             </div>
-            <label className="text-[10px] font-bold text-slate-400 uppercase block mb-1">Speed: {config.speed}x</label>
-            <input 
-              type="range" min="0.5" max="1.5" step="0.1" 
-              className="w-full h-1 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-indigo-600"
-              value={config.speed}
-              onChange={(e) => setConfig({ ...config, speed: parseFloat(e.target.value) })}
-            />
-          </section>
 
-          <button
-            disabled={extraction.status !== 'completed' || generation.status === 'generating'}
-            onClick={generateAudiobook}
-            className="w-full bg-indigo-600 text-white font-bold py-4 rounded-2xl shadow-lg hover:bg-indigo-700 disabled:bg-slate-300 transition-all flex items-center justify-center gap-2"
-          >
-            {generation.status === 'generating' ? `Narrating... ${generation.progress}%` : 'Create Audio'}
-          </button>
+            {/* Generate */}
+            <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+              <h2 className="text-lg font-semibold text-slate-900 mb-3">3) Generate Audiobook</h2>
+
+              <button
+                className="w-full py-3 rounded-lg bg-slate-900 text-white font-semibold hover:bg-slate-800 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                disabled={extraction.status !== 'completed' || generation.status === 'generating'}
+                onClick={generateAudiobook}
+              >
+                {generation.status === 'generating' ? "Generating..." : "Create Audio"}
+              </button>
+
+              {generation.status === 'generating' && (
+                <div className="mt-4">
+                  <div className="w-full bg-slate-200 rounded-full h-2 overflow-hidden">
+                    <div
+                      className="bg-sky-500 h-2"
+                      style={{ width: `${generation.progress}%` }}
+                    />
+                  </div>
+                  <div className="text-sm text-slate-600 mt-2">
+                    Progress: {generation.progress}%
+                  </div>
+                </div>
+              )}
+
+              {generation.status === 'error' && (
+                <div className="mt-4 text-sm text-red-700">
+                  ❌ {generation.error || "Something went wrong"}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Right Column */}
+          <div className="space-y-6">
+            {/* Extracted Text Preview */}
+            <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+              <h2 className="text-lg font-semibold text-slate-900 mb-3">Extracted Text Preview</h2>
+              <div className="h-56 overflow-y-auto custom-scrollbar text-sm text-slate-700 whitespace-pre-wrap">
+                {extraction.text ? extraction.text.slice(0, 5000) + (extraction.text.length > 5000 ? '…' : '') : "Upload a PDF to see extracted text here."}
+              </div>
+            </div>
+
+            {/* Audio Player */}
+            <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+              <h2 className="text-lg font-semibold text-slate-900 mb-3">Audio Player</h2>
+
+              {generation.audioUrl ? (
+                <>
+                  <audio ref={audioRef} controls className="w-full mb-4" />
+                  <button
+                    className="w-full py-3 rounded-lg bg-green-600 text-white font-semibold hover:bg-green-500 transition"
+                    onClick={downloadAudio}
+                  >
+                    Download WAV
+                  </button>
+                </>
+              ) : (
+                <div className="text-sm text-slate-600">
+                  Generate audio to preview and download here.
+                </div>
+              )}
+            </div>
+
+            {/* Helpful Info */}
+            <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+              <h2 className="text-lg font-semibold text-slate-900 mb-2">Current Selection</h2>
+              <div className="text-sm text-slate-700">
+                <div><span className="font-semibold">Voice:</span> {selectedVoice?.name}</div>
+                <div><span className="font-semibold">Speed:</span> {config.speed.toFixed(1)}x</div>
+                <div><span className="font-semibold">Quality:</span> {config.quality}</div>
+              </div>
+              <p className="text-xs text-slate-500 mt-3">
+                Tip: For large PDFs, generation can take time because the text is split into chunks for stable audio output.
+              </p>
+            </div>
+          </div>
         </div>
 
-        <div className="lg:col-span-8 space-y-6">
-          <div className="bg-white rounded-3xl shadow-sm border border-slate-100 overflow-hidden flex flex-col min-h-[400px]">
-            <div className="px-6 py-4 border-b border-slate-50 flex justify-between items-center bg-slate-50/30">
-              <h3 className="text-xs font-bold text-slate-500 uppercase">Text Preview</h3>
-              {extraction.text && <span className="text-[10px] font-bold text-slate-400">{extraction.text.length} characters</span>}
-            </div>
-            <div className="flex-1 p-6 overflow-y-auto max-h-[400px] custom-scrollbar text-slate-600 leading-relaxed text-sm font-serif italic whitespace-pre-wrap">
-              {extraction.text || <div className="h-full flex items-center justify-center text-slate-300 italic">No document loaded</div>}
-            </div>
-            
-            {generation.status !== 'idle' && (
-              <div className="p-6 bg-indigo-900 text-white">
-                {generation.status === 'generating' ? (
-                  <div className="w-full bg-indigo-800 h-1.5 rounded-full overflow-hidden">
-                    <div className="h-full bg-indigo-400 transition-all" style={{ width: `${generation.progress}%` }}></div>
-                  </div>
-                ) : generation.status === 'completed' ? (
-                  <div className="flex flex-col md:flex-row items-center gap-4">
-                    <audio ref={audioRef} controls src={generation.audioUrl} className="flex-1 h-8 brightness-110 invert hue-rotate-180" />
-                    <button onClick={downloadAudio} className="bg-white text-indigo-900 px-4 py-2 rounded-xl text-xs font-bold">DOWNLOAD</button>
-                  </div>
-                ) : (
-                  <p className="text-xs text-red-300">{generation.error}</p>
-                )}
-              </div>
-            )}
-          </div>
+        {/* Footer */}
+        <div className="p-4 text-center text-xs text-slate-500 border-t border-slate-200">
+          Built with Gemini TTS + PDF.js • Hobby project
         </div>
       </div>
     </div>
