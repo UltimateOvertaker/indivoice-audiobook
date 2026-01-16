@@ -1,41 +1,22 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { GoogleGenAI, Modality } from '@google/genai';
-import { FALLBACK_SECTION_PAGES, MAX_TEXT_CHUNK_SIZE, VOICE_OPTIONS, VOICE_PREVIEW_TEXT } from './constants';
-import {
-  AudiobookConfig,
-  AudioGenerationStatus,
-  Chapter,
-  ChapterStatus,
-  ExtractionStatus,
-  VoiceGender,
-  VoicePreviewStatus,
-} from './types';
-import { createWavBlob, decodeBase64 } from './utils/audioUtils';
+import { MAX_TEXT_CHUNK_SIZE, VOICE_OPTIONS, VOICE_PREVIEW_TEXT } from './constants';
+import { AudiobookConfig, AudioGenerationStatus, ExtractionStatus, TextSegment } from './types';
+import { createMp3Blob, createSilencePCM, decodeBase64 } from './utils/audioUtils';
 
-// Global reference for PDF.js provided by the script tag in index.html
 declare const pdfjsLib: any;
 
 const SAMPLE_RATE = 24000;
 
-function sanitizeFilenamePart(input: string): string {
-  return input
-    .replace(/[^a-z0-9\- _]/gi, '')
-    .replace(/\s+/g, '_')
-    .slice(0, 60)
-    .trim();
-}
-
 function splitTextIntoChunks(text: string, maxChunkSize: number): string[] {
   const clean = text.replace(/\s+/g, ' ').trim();
   if (!clean) return [];
-
   const chunks: string[] = [];
   let idx = 0;
 
   while (idx < clean.length) {
     let chunk = clean.slice(idx, idx + maxChunkSize);
 
-    // Try to end on a sentence boundary for smoother narration.
     if (idx + maxChunkSize < clean.length) {
       const lastStop = Math.max(chunk.lastIndexOf('.'), chunk.lastIndexOf('!'), chunk.lastIndexOf('?'));
       if (lastStop > maxChunkSize * 0.65) {
@@ -46,158 +27,81 @@ function splitTextIntoChunks(text: string, maxChunkSize: number): string[] {
     chunks.push(chunk);
     idx += chunk.length;
   }
-
   return chunks;
 }
 
-function getHeadingFromPage(pageText: string): string | null {
-  const head = pageText.slice(0, 1800);
-  const lines = head
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean)
-    .slice(0, 30);
-
-  // Common book headings
-  const patterns: RegExp[] = [
-    /^(chapter|chap\.?|ch\.?|section|part)\s+([0-9ivxlcdm]+)\b\s*[:.\-–—]?\s*(.{0,80})$/i,
-    /^(preface|foreword|introduction|prologue|epilogue|afterword|acknowledgements|acknowledgments)\b.*$/i,
-    /^(\d{1,3})\s*[\.-]\s*(.{3,80})$/,
-  ];
-
-  for (const line of lines) {
-    // Ignore pure numbers (page numbers)
-    if (/^\d{1,4}$/.test(line)) continue;
-    if (line.length < 4) continue;
-    for (const re of patterns) {
-      if (re.test(line)) return line;
-    }
-  }
-  return null;
+function normalizeExtractedText(raw: string): string {
+  return raw
+    .replace(/\r/g, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
 }
 
-function detectChaptersFromPages(pagesText: string[]): Chapter[] {
-  const totalPages = pagesText.length;
-  const markers: Array<{ page: number; title: string }> = [];
+/**
+ * Detect "meta/citation" blocks:
+ * - Short lines, multiple lines
+ * - Contains year/date
+ * - Contains typical citation keywords
+ */
+function isMetaBlock(block: string): boolean {
+  const b = block.trim();
+  if (!b) return false;
 
-  for (let i = 0; i < totalPages; i++) {
-    const heading = getHeadingFromPage(pagesText[i] ?? '');
-    if (heading) {
-      const title = heading.replace(/\s+/g, ' ').trim();
-      markers.push({ page: i + 1, title });
-    }
+  const lines = b
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  if (lines.length >= 2 && lines.length <= 6) {
+    const avgLen = lines.reduce((a, l) => a + l.length, 0) / lines.length;
+    const hasYear = /\b(1[6-9]\d{2}|20\d{2})\b/.test(b);
+    const hasDateWord =
+      /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b/i.test(b);
+    const hasCitationWords =
+      /\b(autobiography|foreword|preface|introduction|prologue|epilogue|edition|translated|copyright|volume|vol\.)\b/i.test(b);
+
+    const manyShortLines = lines.filter((l) => l.length <= 65).length >= Math.ceil(lines.length * 0.75);
+
+    if (manyShortLines && (hasYear || hasDateWord || hasCitationWords)) return true;
+    if (avgLen < 55 && (hasYear || hasDateWord)) return true;
   }
 
-  // De-dupe consecutive headings (some PDFs repeat the heading on multiple pages)
-  const deduped: Array<{ page: number; title: string }> = [];
-  for (const m of markers) {
-    const prev = deduped[deduped.length - 1];
-    if (!prev || prev.title.toLowerCase() !== m.title.toLowerCase()) {
-      deduped.push(m);
-    }
+  // Very short "source" line
+  if (b.length < 140) {
+    if (/\b(1[6-9]\d{2}|20\d{2})\b/.test(b)) return true;
+    if (/\b(last sentence of|from the|taken from|source:)\b/i.test(b)) return true;
   }
 
-  // If headings are too sparse, fall back to page-based sections.
-  const usableHeadings = deduped.filter((m, idx, arr) => {
-    const prev = arr[idx - 1];
-    if (!prev) return true;
-    return m.page - prev.page >= 2;
-  });
+  return false;
+}
 
-  const chapters: Chapter[] = [];
+/**
+ * Smart segmentation:
+ * Splits by blank lines into blocks, then labels each block as narration or meta.
+ */
+function buildSmartSegments(text: string): TextSegment[] {
+  const normalized = normalizeExtractedText(text);
+  const blocks = normalized
+    .split(/\n\s*\n/)
+    .map((b) => b.trim())
+    .filter(Boolean);
 
-  if (usableHeadings.length >= 2) {
-    for (let i = 0; i < usableHeadings.length; i++) {
-      const startPage = usableHeadings[i].page;
-      const endPage = i < usableHeadings.length - 1 ? usableHeadings[i + 1].page - 1 : totalPages;
+  if (blocks.length === 0) return [];
 
-      if (endPage < startPage) continue;
+  return blocks.map((block) => ({
+    type: isMetaBlock(block) ? 'meta' : 'narration',
+    text: block,
+  }));
+}
 
-      const text = pagesText.slice(startPage - 1, endPage).join('\n\n').trim();
-      if (!text) continue;
-
-      chapters.push({
-        id: `ch_${startPage}_${endPage}`,
-        title: usableHeadings[i].title,
-        startPage,
-        endPage,
-        text,
-        selected: true,
-        status: 'pending',
-        progress: 0,
-      });
-    }
-  } else if (usableHeadings.length === 1) {
-    const start = usableHeadings[0].page;
-
-    // Front matter (optional)
-    if (start > 1) {
-      const fmText = pagesText.slice(0, start - 1).join('\n\n').trim();
-      if (fmText) {
-        chapters.push({
-          id: `ch_1_${start - 1}`,
-          title: 'Front Matter',
-          startPage: 1,
-          endPage: start - 1,
-          text: fmText,
-          selected: true,
-          status: 'pending',
-          progress: 0,
-        });
-      }
-    }
-
-    const mainText = pagesText.slice(start - 1).join('\n\n').trim();
-    if (mainText) {
-      chapters.push({
-        id: `ch_${start}_${totalPages}`,
-        title: usableHeadings[0].title,
-        startPage: start,
-        endPage: totalPages,
-        text: mainText,
-        selected: true,
-        status: 'pending',
-        progress: 0,
-      });
-    }
-  } else {
-    // Fallback: split by fixed page blocks
-    const block = Math.max(1, FALLBACK_SECTION_PAGES);
-    let sectionNo = 1;
-    for (let startPage = 1; startPage <= totalPages; startPage += block) {
-      const endPage = Math.min(totalPages, startPage + block - 1);
-      const text = pagesText.slice(startPage - 1, endPage).join('\n\n').trim();
-      if (!text) continue;
-      chapters.push({
-        id: `sec_${sectionNo}_${startPage}_${endPage}`,
-        title: `Section ${sectionNo}`,
-        startPage,
-        endPage,
-        text,
-        selected: true,
-        status: 'pending',
-        progress: 0,
-      });
-      sectionNo++;
-    }
-  }
-
-  // Safety: if everything failed, treat whole document as one chapter
-  if (chapters.length === 0) {
-    const allText = pagesText.join('\n\n').trim();
-    chapters.push({
-      id: 'ch_all',
-      title: 'Full Document',
-      startPage: 1,
-      endPage: totalPages,
-      text: allText,
-      selected: true,
-      status: 'pending',
-      progress: 0,
-    });
-  }
-
-  return chapters;
+function sanitizeFilenamePart(input: string): string {
+  return input
+    .replace(/[^a-z0-9\- _]/gi, '')
+    .replace(/\s+/g, '_')
+    .slice(0, 60)
+    .trim();
 }
 
 const App: React.FC = () => {
@@ -210,11 +114,9 @@ const App: React.FC = () => {
     status: 'idle',
   });
 
-  const [chapters, setChapters] = useState<Chapter[]>([]);
-
   const [config, setConfig] = useState<AudiobookConfig>({
-    voiceId: VOICE_OPTIONS[1].id, // Aditi (Warm)
-    speed: 1.0,
+    voiceId: VOICE_OPTIONS[1].id,
+    speed: 0.9, // default slightly slower
     quality: 'high',
   });
 
@@ -223,11 +125,15 @@ const App: React.FC = () => {
     status: 'idle',
   });
 
-  const [voicePreview, setVoicePreview] = useState<VoicePreviewStatus>({ status: 'idle' });
+  const [smartNarration, setSmartNarration] = useState<boolean>(true);
+  const [playbackRate, setPlaybackRate] = useState<number>(1.0);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const cancelAllRef = useRef<boolean>(false);
-  const cancelledChapterIdsRef = useRef<Set<string>>(new Set());
+  const audioRef = useRef<HTMLAudioElement>(null);
+
+  const cancelRef = useRef<boolean>(false);
+
+  const selectedVoice = useMemo(() => VOICE_OPTIONS.find((v) => v.id === config.voiceId), [config.voiceId]);
 
   useEffect(() => {
     if (typeof pdfjsLib !== 'undefined') {
@@ -236,72 +142,42 @@ const App: React.FC = () => {
     }
   }, []);
 
-  // Clean up any object URLs when leaving page
   useEffect(() => {
-    return () => {
-      chapters.forEach((c) => c.audioUrl && URL.revokeObjectURL(c.audioUrl));
-      if (voicePreview.audioUrl) URL.revokeObjectURL(voicePreview.audioUrl);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const selectedVoice = useMemo(() => VOICE_OPTIONS.find((v) => v.id === config.voiceId), [config.voiceId]);
-  const selectedChapters = useMemo(() => chapters.filter((c) => c.selected), [chapters]);
-  const completedSelected = useMemo(
-    () => selectedChapters.filter((c) => c.status === 'completed').length,
-    [selectedChapters]
-  );
-
-  const overallLabel = useMemo(() => {
-    if (generation.status === 'generating') {
-      const total = selectedChapters.length || 1;
-      return `Converting ${completedSelected}/${total} chapters…`;
+    if (audioRef.current) {
+      audioRef.current.playbackRate = playbackRate;
     }
-    return '';
-  }, [generation.status, completedSelected, selectedChapters.length]);
-
-  const resetAll = () => {
-    cancelAllRef.current = false;
-    cancelledChapterIdsRef.current.clear();
-    setGeneration({ status: 'idle', progress: 0 });
-    setVoicePreview({ status: 'idle' });
-  };
+  }, [playbackRate, generation.audioUrl]);
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
     if (!selectedFile || selectedFile.type !== 'application/pdf') return;
 
-    // Cleanup old urls
-    chapters.forEach((c) => c.audioUrl && URL.revokeObjectURL(c.audioUrl));
-    if (voicePreview.audioUrl) URL.revokeObjectURL(voicePreview.audioUrl);
-
     setFile(selectedFile);
-    setChapters([]);
-    resetAll();
+    setGeneration({ status: 'idle', progress: 0 });
+    setExtraction({ totalPageCount: 0, currentPage: 0, text: '', status: 'processing' });
+
     await extractText(selectedFile);
   };
 
   const extractText = async (pdfFile: File) => {
     if (typeof pdfjsLib === 'undefined') {
       setExtraction((prev) => ({ ...prev, status: 'error' }));
-      console.error('PDF.js not loaded yet.');
       return;
     }
 
-    setExtraction({ totalPageCount: 0, currentPage: 0, text: '', status: 'processing' });
     try {
       const arrayBuffer = await pdfFile.arrayBuffer();
       const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
       const pdf = await loadingTask.promise;
 
-      const perPageText: string[] = [];
+      let fullText = '';
       setExtraction((prev) => ({ ...prev, totalPageCount: pdf.numPages }));
 
-      let fullText = '';
       for (let i = 1; i <= pdf.numPages; i++) {
         const page = await pdf.getPage(i);
         const content = await page.getTextContent();
 
+        // Preserve line breaks using hasEOL
         const pageText = content.items
           .map((item: any) => {
             const str = item?.str ?? '';
@@ -312,581 +188,403 @@ const App: React.FC = () => {
           .replace(/\n{3,}/g, '\n\n')
           .trim();
 
-        perPageText.push(pageText);
         fullText += pageText + '\n\n';
 
-        setExtraction((prev) => ({ ...prev, currentPage: i, text: fullText }));
+        setExtraction((prev) => ({
+          ...prev,
+          currentPage: i,
+          text: fullText,
+        }));
       }
 
       setExtraction((prev) => ({ ...prev, status: 'completed' }));
-
-      // Detect chapters immediately
-      const detected = detectChaptersFromPages(perPageText);
-      setChapters(detected);
-    } catch (err) {
-      console.error('PDF Extraction Error:', err);
+    } catch (error) {
+      console.error('PDF Extraction Error:', error);
       setExtraction((prev) => ({ ...prev, status: 'error' }));
     }
   };
 
-  const toggleChapterSelected = (id: string) => {
-    if (generation.status === 'generating') return;
-    setChapters((prev) => prev.map((c) => (c.id === id ? { ...c, selected: !c.selected } : c)));
-  };
-
-  const selectAllChapters = () => {
-    if (generation.status === 'generating') return;
-    setChapters((prev) => prev.map((c) => ({ ...c, selected: true })));
-  };
-
-  const deselectAllChapters = () => {
-    if (generation.status === 'generating') return;
-    setChapters((prev) => prev.map((c) => ({ ...c, selected: false })));
-  };
-
-  const cancelChapter = (id: string) => {
-    cancelledChapterIdsRef.current.add(id);
-    setChapters((prev) =>
-      prev.map((c) => {
-        if (c.id !== id) return c;
-        if (c.status === 'completed') return c;
-        return { ...c, status: 'cancelled', progress: 0 };
-      })
-    );
-  };
-
-  const cancelAll = () => {
-    cancelAllRef.current = true;
+  const cancelConversion = () => {
+    cancelRef.current = true;
     setGeneration((prev) => ({ ...prev, status: 'cancelled' }));
-
-    setChapters((prev) =>
-      prev.map((c) => {
-        if (!c.selected) return c;
-        if (c.status === 'completed') return c;
-        if (c.status === 'cancelled') return c;
-        return { ...c, status: 'cancelled', progress: 0 };
-      })
-    );
   };
 
-  const downloadFromUrl = (audioUrl: string, filename: string) => {
-    const link = document.createElement('a');
-    link.href = audioUrl;
-    link.download = filename;
-    link.click();
-  };
+  const generateAudiobook = async () => {
+    if (!extraction.text) return;
 
-  const downloadChapter = (chapter: Chapter) => {
-    if (!chapter.audioUrl) return;
-    const base = file?.name.replace(/\.pdf$/i, '') || 'audiobook';
-    const title = sanitizeFilenamePart(chapter.title || `Chapter_${chapter.startPage}`);
-    downloadFromUrl(chapter.audioUrl, `IndiVoice_${base}_${title}.wav`);
-  };
-
-  const downloadAllCompleted = () => {
-    const completed = chapters.filter((c) => c.selected && c.status === 'completed' && c.audioUrl);
-    if (completed.length === 0) return;
-
-    completed.forEach((c, idx) => {
-      setTimeout(() => downloadChapter(c), idx * 300);
-    });
-  };
-
-  const convertTextToWavUrl = async (
-    text: string,
-    voiceName: string,
-    speed: number,
-    shouldCancel: () => boolean,
-    onProgress: (pct: number) => void
-  ): Promise<{ audioUrl?: string; status: ChapterStatus; error?: string }> => {
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
-    const chunks = splitTextIntoChunks(text, MAX_TEXT_CHUNK_SIZE);
-    if (chunks.length === 0) {
-      return { status: 'error', error: 'No readable text found in this section.' };
-    }
-
-    const pcmChunks: Int16Array[] = [];
-
-    for (let i = 0; i < chunks.length; i++) {
-      if (shouldCancel()) {
-        return { status: 'cancelled' };
-      }
-
-      const chunk = chunks[i].trim();
-      if (!chunk) continue;
-
-      const prompt = `Read this text clearly as an Indian audiobook narrator.\nSpeed factor: ${speed}.\nText: ${chunk}`;
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-preview-tts',
-        contents: [{ parts: [{ text: prompt }] }],
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName },
-            },
-          },
-        },
+    const apiKey = process.env.API_KEY;
+    if (!apiKey) {
+      setGeneration({
+        status: 'error',
+        progress: 0,
+        error: 'API key is missing. Add API_KEY in Vercel Environment Variables.',
       });
-
-      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      if (base64Audio) {
-        const bytes = decodeBase64(base64Audio);
-        const pcm = new Int16Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-        pcmChunks.push(pcm);
-      }
-
-      const pct = Math.round(((i + 1) / chunks.length) * 100);
-      onProgress(pct);
+      return;
     }
 
-    if (shouldCancel()) {
-      return { status: 'cancelled' };
-    }
-
-    if (pcmChunks.length === 0) {
-      return { status: 'error', error: 'The TTS model returned no audio for this section.' };
-    }
-
-    const totalLength = pcmChunks.reduce((acc, c) => acc + c.length, 0);
-    const combinedPcm = new Int16Array(totalLength);
-    let offset = 0;
-    for (const c of pcmChunks) {
-      combinedPcm.set(c, offset);
-      offset += c.length;
-    }
-
-    const wavBlob = createWavBlob(combinedPcm, SAMPLE_RATE);
-    const audioUrl = URL.createObjectURL(wavBlob);
-
-    return { status: 'completed', audioUrl };
-  };
-
-  const generateSelectedChapters = async () => {
     if (!selectedVoice) return;
-    if (selectedChapters.length === 0) return;
 
-    cancelAllRef.current = false;
-    cancelledChapterIdsRef.current.clear();
-
-    setChapters((prev) =>
-      prev.map((c) => {
-        if (!c.selected) return c;
-        if (c.status === 'completed') return c;
-        return { ...c, status: 'queued', progress: 0, error: undefined };
-      })
-    );
-
+    cancelRef.current = false;
     setGeneration({ status: 'generating', progress: 0 });
 
     try {
-      const toConvert = chapters.filter((c) => c.selected);
-      const total = toConvert.length;
-      let done = 0;
+      const ai = new GoogleGenAI({ apiKey });
 
-      for (const ch of toConvert) {
-        if (cancelAllRef.current) break;
-        if (cancelledChapterIdsRef.current.has(ch.id)) {
-          done++;
-          continue;
-        }
+      const segments: TextSegment[] = smartNarration
+        ? buildSmartSegments(extraction.text)
+        : [{ type: 'narration', text: normalizeExtractedText(extraction.text) }];
 
-        setGeneration((prev) => ({ ...prev, currentChapterId: ch.id }));
-        setChapters((prev) =>
-          prev.map((c) => (c.id === ch.id ? { ...c, status: 'converting', progress: 0 } : c))
-        );
-
-        const shouldCancel = () => cancelAllRef.current || cancelledChapterIdsRef.current.has(ch.id);
-
-        const result = await convertTextToWavUrl(ch.text, selectedVoice.geminiVoice, config.speed, shouldCancel, (pct) => {
-          setChapters((prev) => prev.map((c) => (c.id === ch.id ? { ...c, progress: pct } : c)));
-        });
-
-        if (result.status === 'completed' && result.audioUrl) {
-          setChapters((prev) =>
-            prev.map((c) => (c.id === ch.id ? { ...c, status: 'completed', progress: 100, audioUrl: result.audioUrl } : c))
-          );
-        } else if (result.status === 'cancelled') {
-          setChapters((prev) => prev.map((c) => (c.id === ch.id ? { ...c, status: 'cancelled', progress: 0 } : c)));
-        } else {
-          setChapters((prev) =>
-            prev.map((c) =>
-              c.id === ch.id
-                ? { ...c, status: 'error', progress: 0, error: result.error || 'Failed to convert this chapter.' }
-                : c
-            )
-          );
-        }
-
-        done++;
-        setGeneration((prev) => ({ ...prev, progress: Math.round((done / total) * 100) }));
+      if (segments.length === 0) {
+        setGeneration({ status: 'error', progress: 0, error: 'No readable text found in the PDF.' });
+        return;
       }
 
-      if (cancelAllRef.current) {
+      // Build all tasks (chunk per segment)
+      const tasks: Array<{ type: 'narration' | 'meta'; chunk: string; isLastChunkOfSegment: boolean }> = [];
+      for (const seg of segments) {
+        const chunks = splitTextIntoChunks(seg.text, MAX_TEXT_CHUNK_SIZE);
+        for (let i = 0; i < chunks.length; i++) {
+          tasks.push({
+            type: seg.type,
+            chunk: chunks[i],
+            isLastChunkOfSegment: i === chunks.length - 1,
+          });
+        }
+      }
+
+      const pcmParts: Int16Array[] = [];
+      const totalTasks = tasks.length || 1;
+
+      const mp3Bitrate = config.quality === 'high' ? 128 : 96;
+
+      for (let i = 0; i < tasks.length; i++) {
+        if (cancelRef.current) break;
+
+        const t = tasks[i];
+
+        // Two different speaking styles
+        const instruction =
+          t.type === 'narration'
+            ? `You are a professional Indian audiobook narrator.
+Speak naturally with clear pauses and expressive intonation.
+Keep the pace comfortable (not fast), and pause slightly at commas and sentence endings.
+Narrate this text:`
+            : `Read the following as a citation/reference note.
+Speak slightly faster, softer, and with reduced emphasis.
+Do NOT announce that this is a reference, just read it differently:`;
+
+        const prompt = `${instruction}\n\nRequested speed factor: ${config.speed}\n\n${t.chunk}`;
+
+        const response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash-preview-tts',
+          contents: [{ parts: [{ text: prompt }] }],
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: selectedVoice.geminiVoice },
+              },
+            },
+          },
+        });
+
+        const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+
+        if (!base64Audio) {
+          throw new Error('No audio returned from Gemini. Try again.');
+        }
+
+        const bytes = decodeBase64(base64Audio);
+
+        // Convert bytes -> Int16Array PCM
+        const pcm = new Int16Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+        pcmParts.push(pcm);
+
+        // Add actual silence breaks between paragraphs/segments
+        if (t.isLastChunkOfSegment) {
+          // narration gets longer pauses than citation blocks
+          const pauseSeconds = t.type === 'narration' ? 0.55 : 0.35;
+          pcmParts.push(createSilencePCM(pauseSeconds, SAMPLE_RATE));
+        }
+
+        const pct = Math.round(((i + 1) / totalTasks) * 100);
+        setGeneration({ status: 'generating', progress: pct });
+      }
+
+      if (cancelRef.current) {
         setGeneration((prev) => ({ ...prev, status: 'cancelled' }));
         return;
       }
 
-      setGeneration((prev) => ({ ...prev, status: 'completed', progress: 100 }));
-    } catch (err: any) {
-      console.error('Generation error:', err);
-      setGeneration({ status: 'error', progress: 0, error: err?.message || 'Failed to generate audiobook.' });
-    }
-  };
+      // Combine PCM
+      const totalSamples = pcmParts.reduce((sum, p) => sum + p.length, 0);
+      const combinedPCM = new Int16Array(totalSamples);
 
-  const previewVoice = async (voiceId: string) => {
-    const voice = VOICE_OPTIONS.find((v) => v.id === voiceId);
-    if (!voice) return;
+      let offset = 0;
+      for (const part of pcmParts) {
+        combinedPCM.set(part, offset);
+        offset += part.length;
+      }
 
-    if (voicePreview.audioUrl) URL.revokeObjectURL(voicePreview.audioUrl);
+      // MP3 export
+      const mp3Blob = createMp3Blob(combinedPCM, SAMPLE_RATE, mp3Bitrate);
+      const audioUrl = URL.createObjectURL(mp3Blob);
 
-    setVoicePreview({ status: 'loading', voiceId });
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      setGeneration({ status: 'completed', progress: 100, audioUrl });
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-preview-tts',
-        contents: [
-          {
-            parts: [
-              {
-                text: `Read this in a natural Indian audiobook tone. Speed factor: ${config.speed}. Text: ${VOICE_PREVIEW_TEXT}`,
-              },
-            ],
-          },
-        ],
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: voice.geminiVoice },
-            },
-          },
-        },
+      if (audioRef.current) {
+        audioRef.current.src = audioUrl;
+      }
+    } catch (error: any) {
+      console.error('Audiobook generation failed:', error);
+      setGeneration({
+        status: 'error',
+        progress: 0,
+        error: error?.message || 'Something went wrong',
       });
-
-      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      if (!base64Audio) throw new Error('No audio returned for preview.');
-
-      const bytes = decodeBase64(base64Audio);
-      const pcm = new Int16Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-      const wav = createWavBlob(pcm, SAMPLE_RATE);
-      const url = URL.createObjectURL(wav);
-
-      setVoicePreview({ status: 'ready', voiceId, audioUrl: url });
-    } catch (err: any) {
-      console.error('Voice preview error:', err);
-      setVoicePreview({ status: 'error', voiceId, error: err?.message || 'Preview failed.' });
     }
   };
 
-  const canStart = extraction.status === 'completed' && selectedChapters.length > 0 && generation.status !== 'generating';
+  const downloadAudio = () => {
+    if (!generation.audioUrl) return;
+
+    const base = file?.name.replace(/\.pdf$/i, '') || 'audiobook';
+    const fileSafe = sanitizeFilenamePart(base);
+
+    const link = document.createElement('a');
+    link.href = generation.audioUrl;
+    link.download = `IndiVoice_${fileSafe}.mp3`;
+    link.click();
+  };
+
+  const canGenerate = extraction.status === 'completed' && generation.status !== 'generating';
 
   return (
-    <div className="max-w-6xl mx-auto px-4 py-8 md:py-16">
-      <header className="text-center mb-10">
-        <div className="inline-block bg-indigo-100 text-indigo-700 px-4 py-1 rounded-full text-xs font-bold tracking-widest uppercase mb-4">
-          PDF to Audiobook
+    <div className="min-h-screen flex items-center justify-center p-4">
+      <div className="w-full max-w-5xl bg-white/80 backdrop-blur-sm shadow-xl rounded-2xl overflow-hidden">
+        <div className="p-6 border-b border-slate-200 bg-gradient-to-r from-rose-50 to-sky-50">
+          <h1 className="text-3xl font-bold text-slate-900">IndiVoice PDF Audiobook</h1>
+          <p className="text-slate-600 mt-1">
+            Smarter narration, better pauses, and MP3 downloads for offline listening.
+          </p>
         </div>
-        <h1 className="text-4xl md:text-5xl font-black text-indigo-950 mb-3">
-          IndiVoice <span className="text-indigo-500">🎧</span>
-        </h1>
-        <p className="text-slate-500 text-lg max-w-2xl mx-auto">
-          Auto-detect chapters, convert one-by-one, and download each chapter as soon as it is ready.
-        </p>
-      </header>
 
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-        {/* LEFT */}
-        <div className="lg:col-span-4 space-y-6">
-          {/* 1. Document */}
-          <section className="bg-white rounded-3xl p-6 shadow-sm border border-slate-100">
-            <h2 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4">1. Document</h2>
-            <div
-              onClick={() => fileInputRef.current?.click()}
-              className={`border-2 border-dashed rounded-2xl p-6 text-center cursor-pointer transition-all ${
-                file ? 'border-indigo-200 bg-indigo-50/30' : 'border-slate-200 hover:border-indigo-300'
-              }`}
-            >
-              <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" accept=".pdf" />
-              <div className="text-3xl mb-2">{file ? '📄' : '📤'}</div>
-              <p className="text-sm font-semibold text-slate-700 truncate">{file ? file.name : 'Choose PDF'}</p>
+        <div className="p-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* LEFT */}
+          <div className="space-y-6">
+            {/* Upload */}
+            <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+              <h2 className="text-lg font-semibold text-slate-900 mb-3">1) Upload PDF</h2>
+
+              <input ref={fileInputRef} type="file" accept="application/pdf" className="hidden" onChange={handleFileChange} />
+
+              <button
+                className="w-full py-3 rounded-lg border-2 border-dashed border-slate-300 hover:border-slate-400 text-slate-700 font-medium transition"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                {file ? `✅ ${file.name}` : 'Click to Upload PDF'}
+              </button>
 
               {extraction.status === 'processing' && (
-                <p className="text-[10px] font-bold text-indigo-600 mt-2">
-                  Reading: {extraction.currentPage}/{extraction.totalPageCount}
-                </p>
+                <div className="mt-3 text-sm text-slate-600">
+                  Extracting text... Page {extraction.currentPage} / {extraction.totalPageCount || '...'}
+                </div>
+              )}
+
+              {extraction.status === 'completed' && (
+                <div className="mt-3 text-sm text-green-700">✅ Text extracted successfully!</div>
               )}
 
               {extraction.status === 'error' && (
-                <p className="text-[10px] font-bold text-red-600 mt-2">Could not read this PDF. Try another file.</p>
+                <div className="mt-3 text-sm text-red-700">❌ Failed to extract text. Try another PDF.</div>
               )}
             </div>
-          </section>
 
-          {/* 2. Chapters */}
-          <section className="bg-white rounded-3xl p-6 shadow-sm border border-slate-100">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xs font-bold text-slate-400 uppercase tracking-widest">2. Chapters</h2>
-              {chapters.length > 0 && generation.status !== 'generating' && (
-                <div className="flex gap-2">
+            {/* Settings */}
+            <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+              <h2 className="text-lg font-semibold text-slate-900 mb-4">2) Voice & Pacing</h2>
+
+              <label className="block text-sm font-medium text-slate-700 mb-2">Choose voice</label>
+              <select
+                className="w-full p-3 rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-sky-400"
+                value={config.voiceId}
+                onChange={(e) => setConfig((prev) => ({ ...prev, voiceId: e.target.value }))}
+              >
+                {VOICE_OPTIONS.map((voice) => (
+                  <option key={voice.id} value={voice.id}>
+                    {voice.name}
+                  </option>
+                ))}
+              </select>
+
+              <div className="mt-5">
+                <label className="block text-sm font-medium text-slate-700 mb-2">
+                  Narration speed: {config.speed.toFixed(1)}x (lower = slower)
+                </label>
+                <input
+                  type="range"
+                  min={0.7}
+                  max={1.2}
+                  step={0.1}
+                  value={config.speed}
+                  onChange={(e) => setConfig((prev) => ({ ...prev, speed: parseFloat(e.target.value) }))}
+                  className="w-full"
+                />
+              </div>
+
+              <div className="mt-5">
+                <label className="block text-sm font-medium text-slate-700 mb-2">MP3 quality</label>
+                <div className="flex gap-3">
                   <button
-                    onClick={selectAllChapters}
-                    className="text-[10px] font-bold px-2 py-1 rounded-lg bg-slate-50 border border-slate-100 text-slate-600 hover:bg-slate-100"
+                    className={`flex-1 py-2 rounded-lg border ${
+                      config.quality === 'standard'
+                        ? 'bg-sky-50 border-sky-400 text-sky-800'
+                        : 'border-slate-300 text-slate-700'
+                    }`}
+                    onClick={() => setConfig((prev) => ({ ...prev, quality: 'standard' }))}
                   >
-                    All
+                    Standard (96kbps)
                   </button>
                   <button
-                    onClick={deselectAllChapters}
-                    className="text-[10px] font-bold px-2 py-1 rounded-lg bg-slate-50 border border-slate-100 text-slate-600 hover:bg-slate-100"
+                    className={`flex-1 py-2 rounded-lg border ${
+                      config.quality === 'high'
+                        ? 'bg-sky-50 border-sky-400 text-sky-800'
+                        : 'border-slate-300 text-slate-700'
+                    }`}
+                    onClick={() => setConfig((prev) => ({ ...prev, quality: 'high' }))}
                   >
-                    None
+                    High (128kbps)
                   </button>
                 </div>
-              )}
-            </div>
+              </div>
 
-            {extraction.status !== 'completed' && (
-              <div className="text-sm text-slate-400">Upload a PDF to detect chapters automatically.</div>
-            )}
-
-            {extraction.status === 'completed' && chapters.length > 0 && (
-              <div className="space-y-2 max-h-64 overflow-y-auto custom-scrollbar">
-                {chapters.map((ch) => (
-                  <div
-                    key={ch.id}
-                    className={`rounded-2xl border p-3 flex items-start gap-3 ${
-                      ch.selected ? 'border-indigo-200 bg-indigo-50/30' : 'border-slate-100 bg-white'
-                    }`}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={ch.selected}
-                      disabled={generation.status === 'generating'}
-                      onChange={() => toggleChapterSelected(ch.id)}
-                      className="mt-1 accent-indigo-600"
-                    />
-
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="text-xs font-bold text-slate-700 truncate">{ch.title}</div>
-                        <div className="text-[10px] font-bold text-slate-400 shrink-0">
-                          p.{ch.startPage}–{ch.endPage}
-                        </div>
-                      </div>
-
-                      <div className="mt-2 flex items-center gap-2">
-                        <span
-                          className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                            ch.status === 'completed'
-                              ? 'bg-emerald-100 text-emerald-700'
-                              : ch.status === 'converting'
-                              ? 'bg-indigo-100 text-indigo-700'
-                              : ch.status === 'cancelled'
-                              ? 'bg-amber-100 text-amber-700'
-                              : ch.status === 'error'
-                              ? 'bg-red-100 text-red-700'
-                              : 'bg-slate-100 text-slate-600'
-                          }`}
-                        >
-                          {ch.status}
-                        </span>
-
-                        {ch.status === 'converting' && (
-                          <span className="text-[10px] font-bold text-indigo-600">{ch.progress}%</span>
-                        )}
-                      </div>
-
-                      {ch.status === 'converting' && (
-                        <div className="mt-2 w-full bg-indigo-100 h-1.5 rounded-full overflow-hidden">
-                          <div className="h-full bg-indigo-500" style={{ width: `${ch.progress}%` }} />
-                        </div>
-                      )}
-
-                      {ch.status === 'error' && ch.error && <div className="mt-2 text-[10px] text-red-600">{ch.error}</div>}
-
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        {ch.status === 'completed' && ch.audioUrl && (
-                          <>
-                            <button
-                              onClick={() => downloadChapter(ch)}
-                              className="text-[10px] font-bold px-3 py-1 rounded-xl bg-indigo-600 text-white hover:bg-indigo-700"
-                            >
-                              Download
-                            </button>
-                            <audio controls src={ch.audioUrl} className="h-8 w-full" />
-                          </>
-                        )}
-
-                        {(ch.status === 'queued' || ch.status === 'converting' || ch.status === 'pending') &&
-                          generation.status === 'generating' && (
-                            <button
-                              onClick={() => cancelChapter(ch.id)}
-                              className="text-[10px] font-bold px-3 py-1 rounded-xl bg-amber-100 text-amber-800 hover:bg-amber-200"
-                            >
-                              Cancel Chapter
-                            </button>
-                          )}
-                      </div>
-                    </div>
+              <div className="mt-5 flex items-center justify-between">
+                <div>
+                  <div className="text-sm font-medium text-slate-700">Smart narration mode</div>
+                  <div className="text-xs text-slate-500">
+                    Reads citations/sub-text differently (better clarity)
                   </div>
-                ))}
-              </div>
-            )}
-          </section>
-
-          {/* 3. Voice */}
-          <section className="bg-white rounded-3xl p-6 shadow-sm border border-slate-100">
-            <h2 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4">3. Voice Settings</h2>
-
-            <div className="grid grid-cols-2 gap-2 mb-4">
-              {VOICE_OPTIONS.map((v) => (
+                </div>
                 <button
-                  key={v.id}
-                  onClick={() => setConfig((prev) => ({ ...prev, voiceId: v.id }))}
-                  className={`p-2 rounded-xl border text-[10px] font-bold transition-all ${
-                    config.voiceId === v.id
-                      ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
-                      : 'border-slate-100 bg-slate-50 text-slate-500'
+                  className={`px-3 py-2 rounded-lg text-xs font-bold border ${
+                    smartNarration ? 'bg-emerald-50 border-emerald-300 text-emerald-700' : 'bg-slate-50 border-slate-200 text-slate-600'
                   }`}
+                  onClick={() => setSmartNarration((v) => !v)}
                 >
-                  {v.name.split(' ')[0]} ({v.gender === VoiceGender.MALE ? 'M' : 'F'})
+                  {smartNarration ? 'ON' : 'OFF'}
                 </button>
-              ))}
-            </div>
-
-            <div className="flex items-center justify-between mb-2">
-              <label className="text-[10px] font-bold text-slate-400 uppercase">Speed: {config.speed}x</label>
-              {selectedVoice && (
-                <button
-                  onClick={() => previewVoice(config.voiceId)}
-                  className="text-[10px] font-bold px-2 py-1 rounded-lg bg-slate-50 border border-slate-100 text-slate-600 hover:bg-slate-100"
-                >
-                  Preview
-                </button>
-              )}
-            </div>
-
-            <input
-              type="range"
-              min="0.5"
-              max="1.5"
-              step="0.1"
-              className="w-full h-1 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-indigo-600"
-              value={config.speed}
-              onChange={(e) => setConfig((prev) => ({ ...prev, speed: parseFloat(e.target.value) }))}
-            />
-
-            {voicePreview.status === 'loading' && (
-              <div className="mt-3 text-[10px] font-bold text-slate-400">Generating voice preview…</div>
-            )}
-
-            {voicePreview.status === 'ready' && voicePreview.audioUrl && (
-              <div className="mt-3">
-                <audio controls src={voicePreview.audioUrl} className="w-full h-8" />
-              </div>
-            )}
-
-            {voicePreview.status === 'error' && (
-              <div className="mt-3 text-[10px] font-bold text-red-600">{voicePreview.error}</div>
-            )}
-          </section>
-
-          {/* Convert buttons */}
-          <div className="space-y-3">
-            <button
-              disabled={!canStart}
-              onClick={generateSelectedChapters}
-              className="w-full bg-indigo-600 text-white font-bold py-4 rounded-2xl shadow-lg hover:bg-indigo-700 disabled:bg-slate-300 transition-all"
-            >
-              {generation.status === 'generating' ? `Narrating… ${generation.progress}%` : 'Convert Selected Chapters'}
-            </button>
-
-            {generation.status === 'generating' && (
-              <button
-                onClick={cancelAll}
-                className="w-full bg-amber-100 text-amber-900 font-bold py-3 rounded-2xl border border-amber-200 hover:bg-amber-200 transition-all"
-              >
-                Cancel Whole Book
-              </button>
-            )}
-
-            {generation.status === 'completed' && (
-              <button
-                onClick={downloadAllCompleted}
-                className="w-full bg-slate-900 text-white font-bold py-3 rounded-2xl hover:bg-slate-800 transition-all"
-              >
-                Download All Completed Chapters
-              </button>
-            )}
-          </div>
-        </div>
-
-        {/* RIGHT */}
-        <div className="lg:col-span-8 space-y-6">
-          <div className="bg-white rounded-3xl shadow-sm border border-slate-100 overflow-hidden">
-            <div className="px-6 py-4 border-b border-slate-50 flex justify-between items-center bg-slate-50/30">
-              <h3 className="text-xs font-bold text-slate-500 uppercase">Conversion Status</h3>
-              <div className="text-[10px] font-bold text-slate-400">
-                {selectedChapters.length > 0 ? `${selectedChapters.length} selected` : 'No chapters selected'}
               </div>
             </div>
 
-            <div className="p-6">
-              {generation.status === 'idle' && <div className="text-sm text-slate-400">Ready when you are.</div>}
+            {/* Generate */}
+            <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+              <h2 className="text-lg font-semibold text-slate-900 mb-3">3) Convert to MP3 Audiobook</h2>
+
+              <button
+                className="w-full py-3 rounded-lg bg-slate-900 text-white font-semibold hover:bg-slate-800 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                disabled={!canGenerate}
+                onClick={generateAudiobook}
+              >
+                {generation.status === 'generating' ? `Generating... ${generation.progress}%` : 'Create Audiobook (MP3)'}
+              </button>
 
               {generation.status === 'generating' && (
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <div className="text-sm font-semibold text-slate-700">{overallLabel}</div>
-                    <div className="text-xs font-bold text-indigo-600">{generation.progress}%</div>
-                  </div>
-                  <div className="w-full bg-indigo-100 h-2 rounded-full overflow-hidden">
-                    <div className="h-full bg-indigo-500" style={{ width: `${generation.progress}%` }} />
-                  </div>
-                  <div className="text-[10px] text-slate-500">
-                    You can download completed chapters immediately from the chapter list.
-                  </div>
-                </div>
-              )}
-
-              {generation.status === 'completed' && (
-                <div className="space-y-2">
-                  <div className="text-sm font-semibold text-emerald-700">✅ Done! Your chapters are ready.</div>
-                  <div className="text-[10px] text-slate-500">
-                    Use “Download All Completed Chapters” (left panel) or download individual chapters.
-                  </div>
-                </div>
-              )}
-
-              {generation.status === 'cancelled' && (
-                <div className="space-y-2">
-                  <div className="text-sm font-semibold text-amber-700">⚠️ Conversion cancelled.</div>
-                  <div className="text-[10px] text-slate-500">Already completed chapters remain available for download.</div>
-                </div>
+                <button
+                  className="w-full mt-3 py-3 rounded-lg bg-amber-100 text-amber-800 font-semibold hover:bg-amber-200 transition"
+                  onClick={cancelConversion}
+                >
+                  Cancel Conversion
+                </button>
               )}
 
               {generation.status === 'error' && (
-                <div className="text-sm text-red-600">❌ {generation.error || 'Something went wrong.'}</div>
+                <div className="mt-4 text-sm text-red-700">❌ {generation.error || 'Something went wrong'}</div>
+              )}
+
+              {generation.status === 'cancelled' && (
+                <div className="mt-4 text-sm text-amber-700">⚠️ Conversion cancelled.</div>
               )}
             </div>
           </div>
 
-          <div className="bg-white rounded-3xl shadow-sm border border-slate-100 overflow-hidden flex flex-col min-h-[420px]">
-            <div className="px-6 py-4 border-b border-slate-50 flex justify-between items-center bg-slate-50/30">
-              <h3 className="text-xs font-bold text-slate-500 uppercase">Text Preview</h3>
-              {extraction.text && (
-                <span className="text-[10px] font-bold text-slate-400">{extraction.text.length} characters</span>
+          {/* RIGHT */}
+          <div className="space-y-6">
+            {/* Preview */}
+            <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+              <h2 className="text-lg font-semibold text-slate-900 mb-3">Extracted Text Preview</h2>
+              <div className="h-56 overflow-y-auto custom-scrollbar text-sm text-slate-700 whitespace-pre-wrap">
+                {extraction.text
+                  ? normalizeExtractedText(extraction.text).slice(0, 5000) +
+                    (extraction.text.length > 5000 ? '…' : '')
+                  : 'Upload a PDF to see extracted text here.'}
+              </div>
+            </div>
+
+            {/* Audio Player */}
+            <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+              <h2 className="text-lg font-semibold text-slate-900 mb-3">Audio Player</h2>
+
+              {generation.audioUrl ? (
+                <>
+                  <audio ref={audioRef} controls className="w-full mb-4" />
+
+                  <div className="mb-4">
+                    <label className="block text-sm font-medium text-slate-700 mb-2">
+                      Playback speed: {playbackRate.toFixed(2)}x
+                    </label>
+                    <input
+                      type="range"
+                      min={0.75}
+                      max={1.5}
+                      step={0.05}
+                      value={playbackRate}
+                      onChange={(e) => setPlaybackRate(parseFloat(e.target.value))}
+                      className="w-full"
+                    />
+                    <div className="text-xs text-slate-500 mt-1">
+                      (This changes listening speed only — file stays MP3)
+                    </div>
+                  </div>
+
+                  <button
+                    className="w-full py-3 rounded-lg bg-green-600 text-white font-semibold hover:bg-green-500 transition"
+                    onClick={downloadAudio}
+                  >
+                    Download MP3
+                  </button>
+
+                  <button
+                    className="w-full mt-3 py-3 rounded-lg bg-sky-50 border border-sky-300 text-sky-800 font-semibold hover:bg-sky-100 transition"
+                    onClick={generateAudiobook}
+                  >
+                    Re-generate with current voice/speed
+                  </button>
+                </>
+              ) : (
+                <div className="text-sm text-slate-600">Generate audio to preview and download here.</div>
               )}
             </div>
-            <div className="flex-1 p-6 overflow-y-auto max-h-[420px] custom-scrollbar text-slate-600 leading-relaxed text-sm font-serif italic whitespace-pre-wrap">
-              {extraction.text || (
-                <div className="h-full flex items-center justify-center text-slate-300 italic">No document loaded</div>
-              )}
+
+            {/* Helpful info */}
+            <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+              <h2 className="text-lg font-semibold text-slate-900 mb-2">Notes</h2>
+              <ul className="text-sm text-slate-700 list-disc pl-5 space-y-2">
+                <li>
+                  Smart narration reads citations / sub-text differently so they stand out.
+                </li>
+                <li>
+                  We add real silence breaks between paragraphs for better listening.
+                </li>
+                <li>
+                  MP3 download is smaller and easier to store than WAV.
+                </li>
+              </ul>
             </div>
           </div>
+        </div>
+
+        <div className="p-4 text-center text-xs text-slate-500 border-t border-slate-200">
+          Built with Gemini TTS + PDF.js • MP3 Export Enabled
         </div>
       </div>
     </div>
